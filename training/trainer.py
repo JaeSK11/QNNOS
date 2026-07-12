@@ -68,14 +68,20 @@ PROGRESS_INTERVAL = 10  # write progress every N batches
 LOG_GRAD_INTERVAL = 50  # log gradient norms every N batches
 
 
-def get_progress_filename(start_date: str) -> str:
-    """Return progress filename with date prefix, e.g. training_progress_2026-07-07.json"""
-    return f"training_progress_{start_date}.json"
+def get_progress_filename(model_name: str, start_date: str) -> str:
+    """Return progress filename namespaced by model and date, e.g.
+    training_progress_model_out_2026-07-07.json.
+
+    Namespacing by model_name keeps concurrent/sequential runs of different
+    models in the same save_dir from overwriting each other's progress or
+    cross-contaminating warm-start seeds (see train.py:latest_best).
+    """
+    return f"training_progress_{model_name}_{start_date}.json"
 
 
-def write_progress(save_dir: str, status: dict, start_date: str) -> None:
-    """Write training progress to a date-stamped JSON file for external monitoring."""
-    filename = get_progress_filename(start_date)
+def write_progress(save_dir: str, status: dict, model_name: str, start_date: str) -> None:
+    """Write training progress to a model+date-stamped JSON file for monitoring."""
+    filename = get_progress_filename(model_name, start_date)
     path = os.path.join(save_dir, filename)
     os.makedirs(save_dir, exist_ok=True)
     tmp = path + ".tmp"
@@ -314,7 +320,7 @@ def train_model(
                     "best_f1": best_f1,
                     "best_epoch": best_epoch,
                     "learning_rate": current_lr,
-                }, start_date)
+                }, model_name, start_date)
                 eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_epoch))
                 print(
                     f"  [{n_batches}/{total_batches}] "
@@ -336,7 +342,7 @@ def train_model(
             "total_elapsed_seconds": round(time.time() - training_start, 1),
             "best_f1": best_f1,
             "best_epoch": best_epoch,
-        }, start_date)
+        }, model_name, start_date)
 
         model.eval()
         all_preds = []
@@ -411,7 +417,7 @@ def train_model(
             "epochs_without_improvement": epochs_without_improvement,
             "total_elapsed_seconds": round(time.time() - training_start, 1),
             "learning_rate": current_lr,
-        }, start_date)
+        }, model_name, start_date)
 
         # Persist full state every epoch so a crash/daemon-restart can resume
         # from exactly here (next epoch index = epoch + 1).

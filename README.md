@@ -12,8 +12,8 @@ This project builds a hybrid quantum-classical neural network that classifies op
 nPrint CSV (962 cols)
     → Column removal (IPv4 src/dst, TCP ports, seq/ack)
     → SelectKBest (k=20, mutual information, fit on training split only)
-    → RY encoding (20 qubits) + ring CNOT entanglement
-    → 4 variational layers with data re-uploading (RY encode + RY/RZ + ring CNOT)
+    → RY encoding (20 qubits) + ring CNOT (classical XOR on the basis state; not yet entangling)
+    → 4 variational layers with data re-uploading (RY encode + RY/RZ + ring CNOT; entanglement begins here)
     → PauliZ + PauliX + PauliY measurements (60 expectation values)
     → Linear(60, 128) → ReLU → Dropout(0.3) → Linear(128, n_classes)
     → Classification
@@ -106,4 +106,4 @@ QuantumNeuralNetworkOS/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).

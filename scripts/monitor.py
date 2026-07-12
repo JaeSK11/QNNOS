@@ -66,8 +66,8 @@ def show_progress(path):
 def resolve_progress_path(progress_dir):
     """Return the newest date-stamped progress file, or the legacy path.
 
-    The trainer writes training_progress_<date>.json per run; ISO dates sort
-    lexically, so the last match is the most recent run.
+    The trainer writes training_progress_<model>_<date>.json per run; ISO dates
+    sort lexically, so the last match is the most recent run.
     """
     candidates = sorted(Path(progress_dir).glob("training_progress_*.json"))
     if candidates:

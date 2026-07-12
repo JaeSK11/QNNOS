@@ -5,7 +5,7 @@ Variational quantum classifier for passive OS fingerprinting using PennyLane + P
 ## Architecture
 
 - **Data pipeline** (classical): nPrint CSV (962 cols) -> column removal -> SelectKBest(k=20) -> binary tensors
-- **Quantum circuit** (custom QNode): RY encoding (20 qubits) -> ring CNOT entanglement -> 4 variational layers (RY+RZ+CNOT) -> PauliZ+PauliX+PauliY measurements (60 outputs)
+- **Quantum circuit** (custom QNode): RY encoding (20 qubits) -> ring CNOT (classical XOR on the basis state, not yet entangling) -> 4 variational layers, each re-uploading the inputs then RY+RZ+ring CNOT (data re-uploading; entanglement begins here) -> PauliZ+PauliX+PauliY measurements (60 outputs)
 - **Hybrid model**: TorchLayer(QNode) -> Linear(60,128) -> ReLU -> Dropout(0.3) -> Linear(128, n_classes)
 - **Training**: Adam optimizer, FocalLoss (class-weighted, gamma=2.0), early stopping on val F1, adjoint differentiation
 

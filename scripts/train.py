@@ -60,9 +60,12 @@ def load_saved_config(save_dir: str, model_name: str) -> dict:
         return json.load(f)
 
 
-def latest_best(save_dir: str) -> tuple[float, int]:
-    """Best F1 / epoch from the newest progress file, to seed a warm start."""
-    files = sorted(Path(save_dir).glob("training_progress_*.json"))
+def latest_best(save_dir: str, model_name: str) -> tuple[float, int]:
+    """Best F1 / epoch from this model's newest progress file, to seed a warm
+    start. Scoped to model_name so a different model's run in the same dir can't
+    seed an inflated best_f1 that would block the resumed run from checkpointing.
+    """
+    files = sorted(Path(save_dir).glob(f"training_progress_{model_name}_*.json"))
     if not files:
         return 0.0, 0
     try:
@@ -161,7 +164,7 @@ def main() -> None:
                     f"--resume set but no resume or weights checkpoint found in {args.save_dir}."
                 )
             model.load_state_dict(torch.load(best_path, weights_only=True))
-            seed_f1, seed_epoch = latest_best(args.save_dir)
+            seed_f1, seed_epoch = latest_best(args.save_dir, args.model_name)
             resume_state = {
                 "optimizer": None,
                 "scheduler": None,
@@ -193,6 +196,18 @@ def main() -> None:
     )
 
     print(f"\nBest epoch: {history['best_epoch']}, Best validation F1: {history['best_f1']:.4f}")
+
+    # Reload the best checkpoint before the final report. train_model leaves the
+    # in-memory model at the LAST epoch's weights (up to `patience` epochs past
+    # the best after early stopping), and save_checkpoint only persisted the
+    # best weights to disk — so evaluating the in-memory model would describe a
+    # different, worse network than the "Best validation F1" line above.
+    best_path = Path(args.save_dir) / f"{args.model_name}.pt"
+    if best_path.exists():
+        model.load_state_dict(torch.load(best_path, weights_only=True))
+        print(f"Reloaded best checkpoint (epoch {history['best_epoch']}) for final report.")
+    else:
+        print("No saved checkpoint found; reporting last-epoch weights.")
 
     # Final evaluation on the validation split. NOTE: this split doubles as the
     # early-stopping / checkpoint-selection set, so these numbers are validation

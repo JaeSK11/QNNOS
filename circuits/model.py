@@ -26,11 +26,18 @@ def create_circuit(
         # Encode binary features as RY rotations (supports batched inputs)
         qml.AngleEmbedding(inputs * np.pi, wires=range(n_qubits), rotation="Y")
 
-        # Ring topology entanglement (nearest-neighbor + wrap-around)
+        # Ring of CNOTs (nearest-neighbor + wrap-around). NOTE: because the
+        # binary features are encoded as RY(0 or pi), the post-encoding state is
+        # a computational basis state, so this ring is a classical XOR
+        # permutation of bits and creates NO entanglement on its own. Genuine
+        # entanglement only arises once the trainable RY/RZ rotations below put
+        # qubits into superposition.
         for i in range(n_qubits):
             qml.CNOT(wires=[i, (i + 1) % n_qubits])
 
-        # Variational layers with data re-uploading
+        # Variational layers. Each layer re-uploads the input features
+        # (data re-uploading) before its trainable rotations, which increases
+        # the expressivity of the circuit as a function approximator.
         for layer in range(n_layers):
             qml.AngleEmbedding(inputs * np.pi, wires=range(n_qubits), rotation="Y")
             for i in range(n_qubits):
