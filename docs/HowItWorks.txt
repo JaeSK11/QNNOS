@@ -1,0 +1,978 @@
+# How the Quantum Neural Network Classifies Operating Systems
+# ===========================================================
+#
+# A step-by-step walkthrough of what actually happens when a network packet
+# enters the variational quantum circuit, how the model learns, and how it
+# compares to the XGBoost gradient boosting approach.
+
+---
+
+The setup
+
+Say you have 12 OS classes: Ubuntu-14.4-32b, Ubuntu-14.4-64b, Ubuntu-16.4-32b,
+Ubuntu-16.4-64b, Ubuntu-Server, Ubuntu-Web-Server, macOS, Windows-10,
+Windows-10-Pro, Windows-7-Pro, Windows-8.1, Windows-Vista.
+
+The model has two parts:
+
+  1. A quantum circuit with 160 trainable rotation angles (the "quantum weights")
+     -- these are just floating point numbers like 0.47 or -1.23, initialized
+     randomly.
+
+  2. A classical neural network head with 8,844 trainable parameters (regular
+     matrix weights and biases), also initialized randomly.
+
+Before training, the model knows nothing. Every packet gets essentially random
+scores for each OS class.
+
+Total trainable parameters: 160 quantum + 8,844 classical = 9,004.
+
+For comparison, XGBoost uses ~300,000 decision rules across 300+ trees. The
+quantum model tries to accomplish the same task with ~33x fewer parameters by
+operating in an exponentially larger mathematical space.
+
+---
+
+What a qubit actually is (for this explanation)
+
+A qubit is a mathematical object that lives in a 2-dimensional space. Think of it
+as an arrow on a sphere (the Bloch sphere). The arrow can point:
+
+  - Straight up:     |0> state  (measured as +1)
+  - Straight down:   |1> state  (measured as -1)
+  - Anywhere else:   superposition (measured as something between -1 and +1)
+
+When we "measure" a qubit, we get a number between -1 and +1 that tells us how
+much the arrow is pointing up vs down. This is the expectation value of PauliZ.
+
+A rotation gate (RY, RZ) rotates the arrow on this sphere. The angle of rotation
+is either:
+  - Fixed by the input data (encoding stage), or
+  - A trainable parameter that the optimizer adjusts (variational stage)
+
+We have 20 qubits. Together, they form a quantum state in a 2^20 = 1,048,576
+dimensional space. This is the key: 20 simple 2-dimensional objects, when
+entangled, create a state that lives in a million-dimensional space. This is
+where the potential power of quantum computing comes from.
+
+---
+
+Where the 20 features come from (classical data pipeline)
+
+Before anything quantum happens, the data goes through a purely classical
+preprocessing pipeline. This is important: the quantum circuit never sees raw
+packets. It only sees a clean tensor of 20 binary numbers.
+
+  1. Start with an nPrint CSV file. Each row is one network packet, with 962
+     columns: 961 binary features extracted from packet headers (IPv4, TCP, etc.)
+     plus 1 label column (the OS that sent the packet).
+
+  2. Remove identifying columns that would let the model cheat:
+     - IPv4 source/destination addresses (columns 97-160)
+     - TCP source/destination ports (columns 33-48)
+     - TCP sequence and acknowledgment numbers (columns 480-576)
+     - Column 0 (packet index)
+
+     These are removed because they identify specific machines on the network,
+     not the OS itself. A model that learns "IP 192.168.1.5 = Windows-10" would
+     fail on any other network. We want the model to learn OS signatures from
+     protocol behavior, not network topology.
+
+  3. Select the 20 most informative features using mutual information
+     (SelectKBest with mutual_info_classif). This measures the non-linear
+     statistical dependency between each feature and the class labels. Features
+     that carry the most information about which OS sent the packet score
+     highest. The selector is fitted only on training data to avoid data
+     leakage.
+
+     Previously tried f_classif (ANOVA F-scores) in Run 4, which computes
+     between-class vs within-class variance. While theoretically class-aware,
+     f_classif selected 14/20 features with nearly identical F-scores (~7856)
+     — correlated TCP option bits carrying redundant information. This caused
+     a severe regression (F1 dropped 69%, from 0.3510 to 0.1080). Reverted to
+     mutual_info_classif, which handles correlated binary features better by
+     measuring non-linear dependency, producing features with varied scores
+     (0.28-0.68) across diverse parts of the TCP/IP stack.
+
+     The selected features tend to be specific bits from TCP flags, window size
+     fields, TTL patterns, and TCP options -- the parts of packet headers where
+     different OS TCP/IP stacks behave differently.
+
+  4. Encode labels: map OS names to integers 0-11.
+
+  5. Split: 80% training (2,155,786 packets), 20% test (538,947 packets),
+     stratified so each OS has proportional representation in both sets.
+
+  6. Batch: group into batches of 512 packets for training.
+
+Output to the quantum circuit: a tensor of shape (512, 20) -- 512 packets,
+each with 20 binary features (0 or 1). No normalization needed because nPrint
+features are already binary.
+
+---
+
+How a single packet gets processed (forward pass)
+
+Let's trace one network packet through the entire model. Say this packet came
+from a Windows-10 machine. After the classical data pipeline, we have 20 binary
+features selected from the packet headers:
+
+  Packet features: [1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0]
+
+These 20 values are specific bits from the packet's IPv4 and TCP headers --
+things like TTL bit patterns, TCP flags, window size bits, and option fields.
+The 20 most informative bits were chosen by mutual information feature selection
+during preprocessing.
+
+
+STAGE 1: Encoding the packet into qubits
+
+Each of the 20 features gets encoded into one qubit using an RY rotation gate:
+
+  feature value x pi = rotation angle
+
+  Feature 0 = 1  ->  RY(1 x pi) = RY(pi)   ->  qubit 0 rotates to |1> (arrow points down)
+  Feature 1 = 0  ->  RY(0 x pi) = RY(0)    ->  qubit 1 stays at |0> (arrow points up)
+  Feature 2 = 1  ->  RY(1 x pi) = RY(pi)   ->  qubit 2 rotates to |1>
+  Feature 3 = 1  ->  RY(1 x pi) = RY(pi)   ->  qubit 3 rotates to |1>
+  Feature 4 = 0  ->  RY(0 x pi) = RY(0)    ->  qubit 4 stays at |0>
+  ...and so on for all 20 qubits.
+
+This is implemented as qml.AngleEmbedding(inputs * pi, rotation="Y") in
+PennyLane. One line of code, but it creates the foundation for everything
+that follows.
+
+After encoding, the 20-qubit register looks like:
+
+  q0:  |1>     (feature was 1)
+  q1:  |0>     (feature was 0)
+  q2:  |1>     (feature was 1)
+  q3:  |1>     (feature was 1)
+  q4:  |0>     (feature was 0)
+  q5:  |0>     (feature was 0)
+  q6:  |1>     (feature was 1)
+  ...
+  q19: |0>     (feature was 0)
+
+Right now, each qubit is independent -- it only knows about its own feature.
+The full 20-qubit state is just the product of the individual states. No
+quantum advantage yet.
+
+
+STAGE 2: Entanglement (ring topology)
+
+Now we apply CNOT gates in a ring pattern -- each qubit entangles with its
+neighbor, wrapping around:
+
+  CNOT(q0, q1):   qubit 0 controls qubit 1
+  CNOT(q1, q2):   qubit 1 controls qubit 2
+  CNOT(q2, q3):   qubit 2 controls qubit 3
+  ...
+  CNOT(q18, q19): qubit 18 controls qubit 19
+  CNOT(q19, q0):  qubit 19 controls qubit 0 (wrap-around)
+
+What does a CNOT do? If the control qubit is |1>, it flips the target qubit.
+If the control is |0>, it does nothing. But when the control qubit is in
+superposition (which will happen after the variational layers), something more
+interesting occurs -- the two qubits become entangled, meaning their states are
+correlated and can no longer be described independently.
+
+Why ring topology?
+
+Previously used star topology (all CNOTs through q0 as hub). While star enables
+long-range correlations through the hub, it creates a bottleneck: qubits 1-19
+never directly interact with each other. If features at qubit 8 and qubit 14
+together distinguish windows-10-pro from windows-10, the star topology cannot
+learn that correlation -- it must route everything through q0.
+
+Ring topology allows nearest-neighbor correlations to propagate around the ring.
+Over 4 variational layers, information from any qubit can reach any other qubit
+(it takes at most 10 hops around a 20-qubit ring, so 4 layers provides partial
+but meaningful propagation). The cost vs star is just 1 extra CNOT per layer
+(20 vs 19) -- essentially zero.
+
+After the ring CNOTs on our example packet:
+
+  q0 = |1>, so CNOT flips q1:    q1 goes from |0> to |1>
+  q1 = |1>, so CNOT flips q2:    q2 goes from |1> to |0>
+  q2 = |0>, so CNOT leaves q3:   q3 stays at |1>
+  ...each qubit's state depends on its neighbor.
+
+For binary inputs, this stage just does classical XOR with the neighbor. But its
+real purpose is structural -- in later layers when the qubits are in
+superposition, these CNOT gates create genuine quantum entanglement that lets
+the circuit capture correlations between features.
+
+This is analogous to XGBoost's tree depth: a depth-10 tree can combine up to 10
+features in a single decision path. Entanglement lets the quantum circuit combine
+ALL 20 features simultaneously in a single quantum state.
+
+
+STAGE 3: Variational layers with data re-uploading (where learning happens)
+
+This is the equivalent of XGBoost's boosting rounds -- this is where the model
+has trainable parameters that get adjusted to reduce classification error.
+
+There are 4 layers. Each layer does three things:
+
+  3a. Re-upload the original input data (data re-uploading)
+  3b. Apply trainable rotations to every qubit
+  3c. Re-entangle with ring topology CNOTs
+
+Let's walk through Layer 1:
+
+  First, re-encode the original packet features into the qubits:
+
+    qml.AngleEmbedding(inputs * pi, rotation="Y")
+
+  This is the same encoding as Stage 1, applied again. Why re-upload the data?
+  Without it, the circuit only sees the input once at the start. The variational
+  layers then operate on a fixed encoded state, which limits the circuit to
+  learning first-order Fourier series of the input -- essentially linear decision
+  boundaries per layer. With 12 OS classes sharing similar binary patterns, linear
+  boundaries are insufficient.
+
+  Data re-uploading gives the circuit universal approximation capability: each
+  layer can learn a progressively more complex non-linear function of the input.
+  The variational rotations now interact with the data at every depth level, not
+  just the first.
+
+  Then, for each qubit i (0 to 19):
+    Apply RY(weights[0, i, 0])   -- rotate around Y-axis by a learned angle
+    Apply RZ(weights[0, i, 1])   -- rotate around Z-axis by a learned angle
+
+  Why both RY and RZ? RY controls the amplitude (how much |0> vs |1>). RZ
+  controls the phase (the complex-number angle between |0> and |1>). Together
+  they can rotate the qubit's arrow to any point on the Bloch sphere. This is
+  more expressive than using RY alone (which is what BasicEntanglerLayers does).
+
+  Concrete example with randomly initialized weights:
+
+    Qubit 0:  RY(0.47)  then  RZ(-1.23)
+    Qubit 1:  RY(0.91)  then  RZ(0.33)
+    Qubit 2:  RY(-0.68) then  RZ(2.05)
+    ...
+    Qubit 19: RY(0.15)  then  RZ(-0.77)
+
+  These rotations move each qubit's arrow to a new position on the Bloch sphere.
+  The key: these angles are what the optimizer adjusts during training. Initially
+  they're random, but over time they converge to values that transform the encoded
+  packet into a state that's easy to classify.
+
+  After the rotations, ring topology CNOTs re-entangle the qubits:
+    CNOT(q0, q1), CNOT(q1, q2), ..., CNOT(q18, q19), CNOT(q19, q0)
+
+  Now each qubit is correlated with its neighbor. Over multiple layers, these
+  correlations propagate around the ring -- by layer 4, information from any
+  qubit has had multiple opportunities to influence every other qubit. This is
+  critical for distinguishing confusable classes: features that individually
+  look identical between Windows-10 and Windows-10-Pro can be distinguished by
+  their combinations with neighboring features.
+
+Then Layer 2 repeats with its own 40 trainable angles (different from Layer 1):
+
+    Re-upload: AngleEmbedding(inputs * pi) again
+    Qubit 0:  RY(weights[1,0,0])  then  RZ(weights[1,0,1])
+    Qubit 1:  RY(weights[1,1,0])  then  RZ(weights[1,1,1])
+    ...
+    Then ring CNOTs again.
+
+Then Layer 3 and Layer 4, each with their own 40 angles and ring CNOTs.
+
+Total trainable angles: 4 layers x 20 qubits x 2 rotations = 160 parameters.
+Stored as a tensor of shape (4, 20, 2). The data re-uploading adds 20 RY gates
+per layer but zero trainable parameters (they are data-driven).
+
+After all 4 layers, the 20-qubit quantum state has been thoroughly mixed. Each
+qubit's state depends on:
+  - The original feature it encoded (re-uploaded at every layer)
+  - The features from all other qubits (via ring topology entanglement)
+  - All 160 trainable rotation angles
+
+The state vector -- the mathematical description of all 20 qubits together -- is
+a vector of 2^20 = 1,048,576 complex numbers. This is what the GPU simulator
+is actually computing: matrix multiplications on a million-element vector.
+
+
+STAGE 4: Measurement (triple Pauli)
+
+Now we measure each qubit on THREE axes. For each qubit i, we compute:
+
+  <PauliZ(i)> = expectation value of the Pauli Z operator on qubit i
+  <PauliX(i)> = expectation value of the Pauli X operator on qubit i
+  <PauliY(i)> = expectation value of the Pauli Y operator on qubit i
+
+Each gives a number between -1 and +1. Think of PauliZ, PauliX, and PauliY as
+measuring the qubit's arrow along three perpendicular axes on the Bloch sphere:
+  - PauliZ: up/down (the |0> vs |1> axis)
+  - PauliX: left/right (the |+> vs |-> axis)
+  - PauliY: front/back (the |+i> vs |-i> axis)
+
+Measuring only PauliZ (as in previous runs) is like looking at a 3D object from
+only one angle -- you lose the information visible from other viewpoints. Adding
+PauliX and PauliY gives a complete picture of each qubit's state.
+
+For our Windows-10 packet, after passing through the (randomly initialized)
+circuit, we might get 60 values:
+
+  PauliZ measurements (20 values):
+  q0:  +0.23   q1:  -0.67   q2:  +0.11   ...   q19: +0.61
+
+  PauliX measurements (20 values):
+  q0:  -0.45   q1:  +0.12   q2:  -0.88   ...   q19: -0.33
+
+  PauliY measurements (20 values):
+  q0:  +0.78   q1:  +0.34   q2:  -0.21   ...   q19: +0.55
+
+These 60 numbers are the quantum circuit's output. They summarize what the
+circuit "thinks" about this packet from three complementary perspectives,
+compressed through the 1-million-dimensional quantum state back into 60 real
+numbers. This is 3x more information than PauliZ alone, with zero additional
+gate cost -- the quantum state already contains all this information, we are
+simply reading it more thoroughly.
+
+Right now (before training) these numbers are meaningless -- the circuit hasn't
+learned anything yet.
+
+In the code, this is:
+  [qml.expval(obs(i)) for obs in (qml.PauliZ, qml.PauliX, qml.PauliY)
+   for i in range(20)]
+
+
+STAGE 5: Classical head (mapping measurements to OS classes)
+
+The 60 measurement values go into a classical neural network:
+
+  Step 1: Linear layer -- multiply by a 128x60 weight matrix + bias
+    60 values  ->  128 values
+    Parameters: 60 x 128 weights + 128 biases = 7,808
+
+  Step 2: ReLU activation -- set negative values to zero
+    128 values  ->  128 values (with negatives zeroed out)
+    No parameters.
+
+  Step 3: Dropout (p=0.3) -- randomly zero out 30% of values during training
+    128 values  ->  128 values (with ~38 randomly zeroed)
+    No parameters. Only active during training, not prediction.
+    This prevents the classical head from overfitting to specific quantum
+    measurement patterns and forces it to learn more robust representations.
+
+  Step 4: Linear layer -- multiply by a 12x128 weight matrix + bias
+    128 values  ->  12 values (one per OS class)
+    Parameters: 128 x 12 weights + 12 biases = 1,548
+
+  Total classical head parameters: 7,808 + 1,548 = 9,356.
+
+The output is 12 raw scores (logits), one for each OS:
+
+  [ubuntu-14.4-32b: -0.3, ubuntu-14.4-64b: 0.1, ubuntu-16.4-32b: -0.5,
+   ubuntu-16.4-64b: 0.2, ubuntu-server: -0.1, ubuntu-web-server: 0.4,
+   mac-os-x: -0.7, windows-10: 0.3, windows-10-pro: -0.2,
+   windows-7-pro: 0.1, windows-8.1: 0.5, windows-vista: -0.4]
+
+These get converted to probabilities via softmax:
+
+  [3.8%, 5.7%, 3.1%, 6.3%, 4.7%, 7.7%, 2.6%, 6.9%, 4.2%,
+   5.7%, 8.5%, 3.5%]
+
+Before training, the prediction is essentially random -- Windows-8.1 at 8.5%
+happens to be the highest, but the true label is Windows-10 at 6.9%.
+
+In the code, the classical head is:
+
+  nn.Sequential(
+      nn.Linear(60, 128),
+      nn.ReLU(),
+      nn.Dropout(0.3),
+      nn.Linear(128, 12),
+  )
+
+---
+
+Training: how the model learns (epoch by epoch)
+
+Unlike XGBoost which builds trees one at a time, the quantum model adjusts all
+its parameters simultaneously using gradient descent. Here's what happens:
+
+
+STEP 1: Compute the loss
+
+For the packet above (true label: Windows-10), the loss function measures how
+wrong the prediction is, using Focal Loss with class weights:
+
+  FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t),   gamma = 2.0
+
+Where p_t is the predicted probability of the correct class, alpha_t is the
+class weight, and (1 - p_t)^gamma is the focal modulation factor.
+
+  p_t = 0.069 (predicted probability for Windows-10)
+  focal weight = (1 - 0.069)^2 = 0.867
+  FL  = -alpha_t * 0.867 * log(0.069) = alpha_t * 2.31
+
+Compare with standard cross-entropy:
+  CE  = -alpha_t * log(0.069) = alpha_t * 2.67
+
+At low confidence (p_t = 0.069), focal loss is close to CE — only a 13%
+reduction. The big difference comes for easy, well-classified examples:
+
+  p_t = 0.95 (confident correct prediction):
+  CE  = -alpha_t * log(0.95) = alpha_t * 0.051   (still contributes gradient)
+  FL  = -alpha_t * (0.05)^2 * log(0.95) = alpha_t * 0.00013  (nearly zero)
+
+This means the model stops wasting gradient signal on examples it already
+classifies well (like macOS at F1=0.86) and focuses on hard, confusable
+examples (like distinguishing Windows-10 from Windows-10-Pro). This directly
+addresses the class confusion problem where Windows variants have near-identical
+network fingerprints.
+
+Focal Loss history in this project:
+  - Runs 1-3: used standard weighted CrossEntropyLoss
+  - Run 4: first attempted FocalLoss, but combined with f_classif feature
+    selection which selected 14 redundant features. The combination caused
+    gradient starvation (quantum norms collapsed from 0.033 to 0.008). F1
+    dropped 69%. Post-mortem initially attributed the failure to FocalLoss
+    suppressing early learning, but the redundant features were the primary
+    cause — the model had almost no discriminative signal to learn from.
+  - Run 5: reverted to CrossEntropyLoss with mutual_info_classif features.
+    Confirmed the architecture works (F1=0.3231, healthy gradients).
+  - Run 5+: re-introduced FocalLoss with mutual_info_classif features. The
+    model now has basic competence and diverse features, so focal modulation
+    can target class confusion without starving gradients.
+
+The loss is also scaled by class weights (alpha_t). The training data has
+significant class imbalance (ubuntu-web-server is only ~1.7% of samples, while
+some classes are 15%+). The loss function uses inverse-frequency weighting:
+
+  weight_i = (1 / count_i), normalized so all weights sum to n_classes
+
+This amplifies the loss for rare classes, forcing the model to pay attention to
+them instead of just predicting the majority class. Class weights handle SIZE
+imbalance; focal modulation handles DIFFICULTY imbalance. The two are
+complementary.
+
+
+STEP 2: Compute gradients (backward pass)
+
+This is where quantum computing gets interesting. We need to figure out: for
+each of the 9,004 trainable parameters, which direction should we nudge it to
+reduce the loss?
+
+The gradient tells us: "if you increase this parameter by a tiny amount, the
+loss goes up by X" (positive gradient) or "the loss goes down by X" (negative
+gradient).
+
+For the classical head (2,124 parameters):
+  Standard backpropagation -- the same algorithm used in any neural network.
+  Chain rule through the linear layers and ReLU.
+
+For the quantum circuit (160 parameters):
+  Adjoint differentiation. This is the quantum equivalent of backpropagation:
+
+  1. The simulator already ran the circuit forward, applying each gate one by
+     one and tracking how the 1-million-element state vector changed at each step.
+
+  2. Now it runs backward -- starting from the measurement and working back toward
+     the input. At each gate, it computes the "adjoint" (conjugate transpose),
+     which is like asking "how would a small change in this rotation angle change
+     the final measurement?"
+
+  3. For each of the 160 trainable angles, this produces a gradient: a number
+     that says how much and in which direction to adjust that angle.
+
+  This runs entirely on the GPU. The RTX 3090 performs the matrix multiplications
+  on the 1-million-element state vector in parallel across its 10,496 CUDA cores.
+
+After the backward pass, we have a gradient for every parameter:
+
+  Quantum weights gradient (example):
+    weights[0, 0, 0]:  gradient = +0.034   (increase this RY angle slightly)
+    weights[0, 0, 1]:  gradient = -0.012   (decrease this RZ angle slightly)
+    weights[0, 1, 0]:  gradient = +0.008
+    ...all 160 quantum angles get a gradient.
+
+  Classical head gradient:
+    linear1.weight[0,0]:  gradient = -0.045
+    linear1.weight[0,1]:  gradient = +0.023
+    ...all 2,124 classical parameters get a gradient.
+
+Gradient clipping: before the optimizer uses these gradients, they are clipped
+to a maximum norm of 0.75. This prevents any single batch from making a
+catastrophically large update to the parameters. The training loop logs
+gradient norms separately for the quantum and classical layers every 50 batches,
+with a CLIPPED flag when clipping activates. If the quantum gradient norm is
+near zero while the classical norm is healthy, the circuit may be in a barren
+plateau -- a region of parameter space where gradients vanish due to the
+exponential size of the Hilbert space.
+
+
+STEP 3: Update parameters (optimizer step)
+
+The Adam optimizer adjusts every parameter in the opposite direction of its
+gradient, scaled by the learning rate (0.005):
+
+  For quantum weight[0, 0, 0] with gradient +0.034:
+    The loss increases when this angle increases, so decrease it.
+    new_value = old_value - lr x adjusted_gradient
+
+  Adam is smarter than simple gradient descent -- it maintains a running average of
+  past gradients (momentum) and past squared gradients (adaptive learning rate) for
+  each parameter individually. Parameters with consistently large gradients get
+  smaller updates; parameters with small but persistent gradients get larger updates.
+
+Learning rate schedule:
+  - Warmup: for the first 3 epochs, LR ramps linearly from 0.0005 (lr/10) to
+    0.005. This prevents large destructive updates before the model finds a
+    stable region of the loss landscape.
+  - Plateau reduction: if val F1 doesn't improve for 5 consecutive epochs, the
+    LR is halved. This lets the model take finer steps when it's near a good
+    solution but overshooting.
+  - Floor: LR never drops below 1e-5.
+
+After the optimizer step, all 9,004 parameters have been nudged slightly.
+
+
+STEP 4: Repeat for the next batch
+
+The training data is divided into batches of 512 packets. Steps 1-3 happen for
+each batch:
+
+  Batch 1 (packets 1-512):
+    - Run all 512 packets through the circuit (one at a time, sequentially)
+    - Average the loss across all 512 packets
+    - Compute gradients based on the average loss
+    - Update all 1,228 parameters once
+
+  Batch 2 (packets 513-1024):
+    - Same process with updated parameters
+    - The model is slightly better now
+
+  Batch 3, 4, 5, ..., Batch 4,211:
+    - Each batch makes the model a little better
+
+With 2,155,786 training samples and batch_size=512, that's 4,211 batches per
+epoch. At ~3.6 minutes per batch (217s), one epoch takes about 10.6 days.
+
+When all batches have been processed, that's one epoch.
+
+
+STEP 5: Validate and check early stopping
+
+After each epoch, the model is evaluated on the test set (538,947 packets that
+were NOT used for training). The weighted F1 score measures how well the model
+classifies across all 12 OS classes.
+
+The validation loop also computes per-class F1, printing each class's individual
+score. If any class has F1 = 0.0 (the model never predicts that class), a
+WARNING is printed. This is critical for catching a common failure mode: the
+model achieving decent weighted F1 by getting majority classes right while
+completely ignoring rare classes.
+
+If F1 doesn't improve for 10 consecutive epochs (patience=10), training stops
+early -- the model has converged and further training would just waste compute.
+
+When F1 improves, the model is checkpointed:
+  - model_out.pt: PyTorch state dict (all 2,284 parameters)
+  - model_out.json: config metadata (qubit count, layer count, class names,
+    selected feature indices)
+
+---
+
+What changes as training progresses
+
+Unlike XGBoost where each round adds a new tree, the quantum model refines the
+SAME circuit. The 160 rotation angles gradually shift from random to meaningful:
+
+  Before training (random angles):
+    Every packet produces near-random measurements -> near-random class scores.
+
+  After a few epochs:
+    The circuit learns the most obvious signals. For example:
+    - Certain rotation angles might amplify the effect of TTL bits, pushing
+      Linux packets toward negative measurements on specific qubits and Windows
+      packets toward positive measurements.
+    - The CNOT entanglement allows the circuit to detect COMBINATIONS of
+      features, like "TTL pattern X AND TCP window size pattern Y" which is
+      more discriminative than either alone.
+
+  After many epochs:
+    The rotation angles have fine-tuned to capture subtle differences:
+    - Ubuntu-14.4-32b vs Ubuntu-14.4-64b might differ in only a few TCP option
+      bits. The circuit learns rotation angles that amplify these tiny differences
+      into clearly separated measurement patterns.
+    - The classical head learns which measurement patterns correspond to which OS.
+
+Think of it this way: the quantum circuit learns to create a "fingerprint" of
+each packet as 20 measurement values, where packets from the same OS produce
+similar fingerprints and packets from different OSes produce different fingerprints.
+The classical head then reads these fingerprints and assigns OS labels.
+
+---
+
+How a single packet gets classified (at prediction time)
+
+After training is complete, classifying a new packet works exactly like the
+forward pass described above, but with the trained weights:
+
+  1. Extract 20 selected features from the packet:
+     [1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0]
+
+  2. Encode into 20 qubits via RY rotations:
+     q0 -> |1>, q1 -> |0>, q2 -> |1>, ...
+
+  3. Entangle with ring topology CNOTs:
+     q0->q1, q1->q2, ..., q18->q19, q19->q0
+
+  4. Apply 4 variational layers with data re-uploading and TRAINED rotation angles:
+     Layer 1: Re-upload features, RY(1.23) on q0, RZ(-0.45) on q0, RY(2.11) on q1, ... + ring CNOTs
+     Layer 2: Re-upload features, RY(0.78) on q0, RZ(1.67) on q0, RY(-0.33) on q1, ... + ring CNOTs
+     Layer 3: same pattern with layer 3's trained angles
+     Layer 4: same pattern with layer 4's trained angles
+
+  5. Measure all 20 qubits on three axes (PauliZ + PauliX + PauliY):
+     PauliZ: [+0.91, -0.85, +0.73, ...]
+     PauliX: [-0.33, +0.67, -0.12, ...]
+     PauliY: [+0.45, -0.22, +0.88, ...]
+     -> 60 values total
+
+     After training, these measurements are no longer random -- they form a
+     distinctive 60-dimensional pattern that the classical head recognizes as
+     Windows-10. The triple measurements give the head enough signal to
+     distinguish confusable variants like Windows-10 from Windows-10-Pro.
+
+  6. Classical head maps 60 measurements to class scores:
+     Linear(60->128) -> ReLU -> Dropout(off at prediction) -> Linear(128->12)
+     [ubuntu-14.4-32b: -3.2, ..., windows-10: +5.7, ..., windows-vista: -2.8]
+
+  7. Softmax -> probabilities:
+     [ubuntu-14.4-32b: 0.1%, ..., windows-10: 94.3%, ..., windows-vista: 0.2%]
+
+  8. Prediction: Windows-10 (argmax of logits)
+
+In the code, this is scripts/test.py: load the checkpoint, run the test set
+through the model in batches, collect predictions, and compute the full
+classification report.
+
+---
+
+The gate count and what the GPU is computing
+
+The full circuit for one packet has this many gates:
+
+  Encoding:       20 RY gates
+  Entanglement:   20 CNOT gates (ring topology, including wrap-around)
+  Layer 1:        20 RY (re-upload) + 20 RY + 20 RZ + 20 CNOT = 80 gates
+  Layer 2:        80 gates
+  Layer 3:        80 gates
+  Layer 4:        80 gates
+  ────────────────────────────────
+  Total:          ~360 gates
+
+Each gate is a matrix operation on the 2^20 = 1,048,576 element state vector:
+
+  - RY/RZ gate on qubit i: apply a 2x2 rotation matrix to all pairs of
+    amplitudes where qubit i is |0> vs |1>. This touches all 1M amplitudes.
+  - CNOT gate on qubits i,j: apply a 4x4 matrix to groups of 4 amplitudes
+    corresponding to the |00>, |01>, |10>, |11> subspaces of qubits i and j.
+  - Measurement: compute the inner product of the state vector with itself,
+    projected onto the |0> and |1> subspaces of each qubit.
+
+The GPU parallelizes these matrix operations across its 10,496 CUDA cores.
+Each gate operation touches all 1M amplitudes, and the GPU processes many
+of these in parallel.
+
+For adjoint differentiation (gradient computation):
+  - Forward pass: apply all ~355 gates, the simulator tracks the evolving
+    state vector.
+  - Backward pass: apply the conjugate transpose (adjoint) of each gate in
+    reverse order, computing the gradient of the loss with respect to each
+    trainable rotation angle.
+  - This is mathematically exact -- no sampling noise, no approximation.
+    Unlike real quantum hardware, the simulator has perfect access to the
+    state vector.
+
+At 20 qubits, the state vector is small (16 MB vs 24 GB VRAM). The GPU's
+main advantage here is parallelizing gate operations during the adjoint pass,
+not memory capacity. GPU acceleration becomes essential at ~28+ qubits where
+the state vector exceeds CPU cache sizes.
+
+---
+
+Why entanglement matters for OS fingerprinting
+
+Without entanglement (no CNOT gates), each qubit would be independent. Measuring
+qubit 0 would only tell you about feature 0. Measuring qubit 1 would only tell
+you about feature 1. You'd have 20 independent binary classifiers -- no better
+than checking each bit separately.
+
+With entanglement, the qubits become correlated. The measurement of qubit 19
+depends on the state of qubit 0 (and through q0, indirectly on all other qubits).
+This means the circuit can learn rules like:
+
+  "When the TTL bits (qubits 0-3) have pattern X AND the TCP window size bits
+   (qubits 12-15) have pattern Y, then rotate qubit 19 so its measurement
+   is strongly negative -- indicating this combination means Ubuntu-Server."
+
+This is analogous to XGBoost's feature interactions in deep trees, but the
+quantum circuit captures these interactions through the physics of entanglement
+rather than through branching decision paths.
+
+In the ring topology, each qubit is directly entangled with its neighbor. Over
+4 layers of ring CNOTs with data re-uploading, information propagates around
+the ring: after layer 1, each qubit knows about its immediate neighbor; by
+layer 4, correlations have had 4 opportunities to propagate, reaching qubits
+up to 4 hops away. Combined with re-uploading the raw features at each layer,
+every measurement at the end is influenced by every input feature through both
+the ring entanglement path and the re-encoded data.
+
+Ring topology was chosen over star topology (where q0 was the hub) because star
+prevented direct qubit-to-qubit interaction -- if features at qubit 8 and qubit
+14 together distinguish confusable Windows variants, star topology cannot learn
+that correlation without routing through q0.
+
+---
+
+What the classical head actually does
+
+The classical head seems simple -- just two linear layers with a ReLU -- but it
+plays a crucial role in the architecture.
+
+The quantum circuit outputs 60 numbers in [-1, +1] (20 qubits x 3 Pauli axes).
+These 60 numbers encode the packet's identity in a way that's been shaped by the
+circuit's 160 trained angles. But 60 numbers can't directly represent 12 class
+probabilities.
+
+The classical head solves this:
+
+  Linear(60, 128): expands the 60 measurements into 128 intermediate features.
+  This gives the network more "room" to separate classes. Think of it as
+  projecting a 60-dimensional quantum fingerprint into a 128-dimensional space
+  where the 12 OS classes are more easily separable. The wider layer (128 vs
+  the previous 64) provides extra capacity for distinguishing confusable Windows
+  variants.
+
+  ReLU: introduces non-linearity. Without this, the two linear layers would
+  collapse into a single linear layer. The ReLU lets the network learn non-linear
+  decision boundaries between OS classes.
+
+  Dropout(0.3): during training, randomly zeros out 30% of the 128 values. This
+  forces the network to learn redundant representations rather than relying on
+  any single quantum measurement pattern. At prediction time, dropout is disabled.
+
+  Linear(128, 12): collapses the 128 intermediate features into 12 class logits.
+  Each output neuron effectively learns "this combination of quantum measurements
+  means this OS."
+
+
+Why not skip the classical head and use 12 qubits (one per class)? Because
+PauliZ measurements are in [-1, +1], and the relationship between quantum
+measurements and OS classes is complex. The classical head provides the
+flexibility to map arbitrary measurement patterns to arbitrary class scores.
+
+---
+
+How PennyLane connects quantum to PyTorch
+
+The glue is qml.qnn.TorchLayer. This wraps a PennyLane QNode (the quantum
+circuit) as a standard PyTorch nn.Module:
+
+  circuit, weight_shapes = create_circuit(n_qubits=20, n_layers=4, backend="lightning.gpu")
+  quantum_layer = qml.qnn.TorchLayer(circuit, weight_shapes)
+
+After this, quantum_layer behaves exactly like any other PyTorch layer:
+  - quantum_layer(input_tensor) runs the circuit and returns measurements
+  - quantum_layer.parameters() returns the trainable rotation angles
+  - loss.backward() computes gradients through the circuit via adjoint diff
+  - optimizer.step() updates the rotation angles
+
+The HybridQuantumNet class puts it all together:
+
+  class HybridQuantumNet(nn.Module):
+      quantum_layer = TorchLayer(circuit)     # 160 params
+      classical_head = Sequential(            # 8,844 params
+          Linear(60, 128), ReLU(), Dropout(0.3), Linear(128, 12)
+      )
+
+      def forward(x):
+          q_out = quantum_layer(x)            # (batch, 20) -> (batch, 60)
+          return classical_head(q_out)         # (batch, 60) -> (batch, 12)
+
+PyTorch sees one unified computation graph. It doesn't know or care that part of
+the computation happened on a quantum simulator. Gradients flow seamlessly from
+the loss, through the classical head, through the quantum circuit (via adjoint
+diff), all the way back to the rotation angle parameters.
+
+---
+
+Backend portability
+
+The same circuit code runs on three different simulators:
+
+  default.qubit (CPU, backpropagation):
+    PennyLane's built-in Python simulator. Slow but requires no extra
+    installation. Uses standard backprop for gradients. Used for unit tests
+    and debugging.
+
+  lightning.qubit (CPU, adjoint differentiation):
+    PennyLane's C++ optimized simulator. Faster than default.qubit. Uses
+    adjoint differentiation. Good fallback when no GPU is available.
+
+  lightning.gpu (GPU, adjoint differentiation):
+    NVIDIA cuQuantum-backed simulator. Runs on the RTX 3090. Uses adjoint
+    differentiation with GPU-accelerated matrix operations. The production
+    backend.
+
+Switching is one CLI argument: --backend lightning.gpu
+The circuit definition, training loop, and model architecture are identical
+across all three.
+
+---
+
+Comparison: step by step, same packet through both models
+
+  XGBOOST                                    QUANTUM NEURAL NETWORK
+  ──────────────────────────────────────     ──────────────────────────────────────
+
+  Input: 20 binary features                 Input: 20 binary features
+  [1,0,1,1,0,0,1,0,1,1,0,1,0,0,1,1,0,1,1,0] [1,0,1,1,0,0,1,0,1,1,0,1,0,0,1,1,0,1,1,0]
+
+  Tree 1: "Is feature 8 = 1?"               Encode: RY(pi) on qubits 0,2,3,6,8,9,
+    -> Yes -> "Is feature 3 = 1?"               11,14,15,17,18. RY(0) on the rest.
+    -> Yes -> "Is feature 15 = 1?"
+    -> Yes -> leaf: +0.4 to Windows-10         Entangle: ring CNOTs
+
+  Tree 2: "Is feature 14 = 1?"              Layer 1: re-upload data, RY(w)+RZ(w)
+    -> Yes -> "Is feature 0 = 1?"               on each qubit, then ring CNOTs
+    -> Yes -> leaf: +0.2 to Windows-10
+                                             Layer 2: re-upload, RY(w)+RZ(w),
+  Tree 3: "Is feature 11 = 1?"                ring CNOTs
+    -> Yes -> "Is feature 6 = 1?"
+    -> Yes -> "Is feature 9 = 1?"             Layer 3: same
+    -> Yes -> leaf: +0.15 to Windows-10
+                                             Layer 4: same
+  ...300 more trees...
+                                             Measure: 60 values (Z+X+Y per qubit)
+  Sum all tree outputs:                      -> [-0.91, +0.85, -0.73, ...]
+  [win10: +5.2, win7: -1.3, ubuntu: -2.1,
+   macos: -3.4, ...]                         Classical head: Linear(60->128)->ReLU
+                                               ->Dropout->Linear(128->12)
+  Softmax -> Windows-10: 94%                  -> [win10: +5.7, win7: -1.1, ...]
+
+                                             Softmax -> Windows-10: 94%
+
+  HOW IT LEARNED:                            HOW IT LEARNED:
+  Built trees one at a time.                 Adjusted all 9,004 params at once.
+  Each tree fits the residual errors         Each epoch, gradient descent nudges
+  left by all previous trees.                every rotation angle and linear weight
+  300 rounds x depth 10 = sequential         to reduce classification error.
+  refinement of decision boundaries.         160 quantum angles create a learned
+                                             transformation in 2^20-dimensional
+  300+ trees with ~1000 leaves each          Hilbert space. 8,844 classical weights
+  = hundreds of thousands of if/then         map the quantum output to class scores.
+  rules learned from the data.
+                                             One circuit with 9,004 parameters
+  Prediction: run packet through all         learns a compact representation.
+  300 trees, sum their votes.
+                                             Prediction: run packet through one
+                                             circuit, then one small neural network.
+
+---
+
+Why the quantum model is so much slower
+
+XGBoost training:
+  - Each tree split evaluates features using histogram-based binning.
+  - All splits can be computed in parallel.
+  - Building one tree takes seconds.
+  - 300 trees: minutes total on CPU.
+
+Quantum model training:
+  - Each packet requires simulating a 20-qubit quantum circuit.
+  - The state vector has 1,048,576 complex amplitudes.
+  - Each of ~355 gates multiplies a matrix into this million-element vector.
+  - The backward pass (adjoint differentiation) runs through all gates again
+    in reverse.
+  - With 2,155,786 training samples at 512 per batch, that's 4,211 batches
+    per epoch. Each batch takes ~217 seconds (~3.6 minutes).
+  - One epoch: ~10.6 days.
+  - 50 epochs worst case: ~530 days (~1.5 years).
+  - With early stopping (patience=7): likely converges well before 50 epochs.
+
+The quantum circuit is computing with a million-dimensional state vector for
+every single packet. XGBoost just follows a chain of if/then branches. This
+is the current practical limitation of quantum simulation -- the exponential
+state space that gives quantum computing its theoretical power also makes it
+exponentially expensive to simulate on classical hardware.
+
+On actual quantum hardware, all 1,048,576 amplitudes would be physically present
+simultaneously (in the quantum state of 20 physical qubits), and the circuit
+would execute in microseconds. But we don't have reliable 20-qubit hardware
+with low enough error rates for this application yet, so we simulate.
+
+---
+
+The class imbalance problem
+
+The 12 OS classes are not equally represented in the training data. Some classes
+like Windows-10 or Ubuntu-16.4-64b have many more packets than rare classes like
+ubuntu-web-server (~1.7% of training data).
+
+Without compensation, the model would learn to always predict the majority class.
+A model that predicts "Windows-10" for every packet might get 15% accuracy just
+from the class distribution -- but it would be completely useless.
+
+Four mechanisms address this:
+
+  1. Focal Loss with class weights:
+     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t),  gamma=2.0
+     Class weights (alpha_t) use inverse-frequency: weight_i = (1 / count_i),
+     normalized so weights sum to n_classes. This means a misclassified
+     ubuntu-web-server packet causes ~9x more loss than a misclassified
+     majority-class packet. The focal modulation additionally down-weights
+     easy examples the model already classifies well, focusing gradient
+     signal on the hard, confusable cases (e.g., Windows variant confusion).
+
+  2. Stratified train/test split: both the training and test sets have the same
+     class proportions. This ensures the test set evaluation is representative.
+
+  3. Per-class F1 monitoring: every epoch prints F1 for each individual class,
+     with an explicit WARNING for any class with F1=0.0. Weighted F1 can mask
+     complete failure on rare classes -- per-class reporting makes this visible.
+
+  4. Feature selection (mutual_info_classif): selects features with diverse
+     information content across the TCP/IP stack, avoiding redundant correlated
+     features that can arise with variance-based methods like ANOVA F-scores.
+
+---
+
+Summary: what makes the quantum approach different
+
+1. REPRESENTATION: XGBoost works with the raw 20 bits. The quantum circuit
+   embeds those 20 bits into a 1-million-dimensional quantum state, then
+   learns a transformation in that space.
+
+2. FEATURE INTERACTION: XGBoost captures feature interactions through tree
+   depth (up to 10 features combined per decision path). The quantum circuit
+   captures interactions through entanglement (all 20 features influence all
+   20 measurements simultaneously).
+
+3. PARAMETER EFFICIENCY: XGBoost uses ~300,000 decision rules. The quantum
+   circuit uses 9,004 parameters. Whether fewer parameters means better
+   generalization or underfitting is an empirical question.
+
+4. TRAINING: XGBoost builds trees greedily, one at a time (sequential boosting).
+   The quantum model adjusts all parameters simultaneously via gradient descent
+   (parallel optimization in parameter space).
+
+5. OPTIMIZATION: XGBoost uses exact greedy or histogram-based tree construction
+   (gradient-free for the tree structure, gradient-based for leaf values). The
+   quantum model uses Adam optimizer with exact gradients through the quantum
+   circuit (adjoint differentiation).
+
+6. EXPRESSIVENESS: The custom ansatz uses both RY and RZ rotations per qubit per
+   layer, giving it access to full Bloch sphere coverage. This is more expressive
+   than the original plan's BasicEntanglerLayers (which uses only RY), at the cost
+   of twice as many parameters per layer.
+
+7. SPEED: XGBoost trains in minutes. The quantum model trains in days to weeks.
+   This is the cost of simulating quantum computation on classical hardware. The
+   gap would shrink dramatically on actual quantum processors.

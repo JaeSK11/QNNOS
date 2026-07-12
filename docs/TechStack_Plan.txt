@@ -1,0 +1,1063 @@
+# QuantumNeuralNetworkOS — PennyLane Quantum Neural Network Tech Stack
+# ======================================================================
+
+## Context
+
+This project follows earlier work on passive OS fingerprinting: Qiskit-based quantum classifiers (QuantumOSClassification, devconf-q) and a classical XGBoost model (OsirisML). QuantumNeuralNetworkOS is the PennyLane-based successor: a hybrid quantum-classical neural network that classifies operating systems from network packet features (nPrint format), using PyTorch integration and GPU-accelerated quantum simulation via Docker.
+
+PennyLane was chosen over the existing Qiskit stack for: automatic differentiation (Adam/SGD vs COBYLA), native PyTorch integration via TorchLayer, write-once backend portability, and mini-batch training via DataLoader.
+
+---
+
+## Design Principle: Classical/Quantum Separation
+
+All data processing and transformation is done classically. The quantum circuit only handles model generation.
+
+### Classical Compute (data)
+- nPrint CSV ingestion (962 columns: 961 binary features + 1 label)
+- Column removal (IPv4 src/dst, TCP ports, seq/ack numbers — same indices as OsirisML)
+- Feature selection (SelectKBest with mutual_info_classif, k=20)
+- Label encoding (LabelEncoder)
+- Stratified train/test splitting (80/20)
+- Batching via PyTorch DataLoader (batch_size=512, 4 workers, pinned memory)
+
+### Quantum Compute (model)
+- Receives clean tensor of shape (batch_size, 20)
+- RY AngleEmbedding into 20-qubit circuit (input * pi)
+- Ring topology CNOT entanglement (nearest-neighbor + wrap-around) after encoding
+- 4 variational layers with data re-uploading (AngleEmbedding + per-qubit RY + RZ rotations + ring CNOT)
+- PauliZ + PauliX + PauliY expectation value measurements on all 20 qubits (60 outputs)
+- Classical head maps 60 expectation values to class logits via Linear(60,128)->ReLU->Dropout(0.3)->Linear(128,n_classes)
+- Training via Adam + FocalLoss (class-weighted, gamma=2.0) + adjoint differentiation backprop
+
+The quantum side has no knowledge of nPrint, CSV formats, or feature engineering. It takes a preprocessed feature tensor and learns to classify.
+
+---
+
+## Qubit Count
+
+Using 20 features from SelectKBest with AngleEmbedding (1 feature = 1 qubit):
+
+- **20 qubits**
+- State vector: 2^20 amplitudes x 16 bytes (complex128) = **16 MB**
+- Well within the 24 GB VRAM of the RTX 3090
+
+Reference table:
+
+Qubits | Amplitudes | State vector size
+------ | ---------- | -----------------
+20     | 1M         | 16 MB
+25     | 33M        | 512 MB
+30     | 1B         | 16 GB (fills RTX 3090)
+33     | 8.6B       | 128 GB
+40     | 1T         | 16 TB
+
+At 20 qubits, GPU acceleration provides modest benefit — the circuit is too small to saturate the RTX 3090's 10,496 CUDA cores. The GPU helps with parallel gate operations during adjoint differentiation, but per-batch speedup over lightning.qubit (CPU) is marginal. GPU becomes essential at ~28+ qubits where the state vector exceeds CPU cache sizes.
+
+---
+
+## GPU Hardware
+
+- **GPU**: NVIDIA RTX 3090 (24 GB VRAM)
+- **Backend**: lightning.gpu (NVIDIA cuQuantum SDK)
+- **Why GPU**: parallelized gate operations and batched expectation value computation
+- **NVIDIA driver**: 590.48.01 (supports CUDA 13.x for PyTorch compatibility)
+
+---
+
+## Docker Environment
+
+PennyLane provides official GPU-enabled Docker images on Docker Hub (pennylaneai/pennylane).
+
+### Quick Start
+
+docker run -it --rm --gpus all -v $(pwd):/workspace pennylaneai/pennylane:latest-lightning-gpu /bin/bash
+
+### Dockerfile
+
+FROM pennylaneai/pennylane:latest-lightning-gpu
+
+WORKDIR /workspace
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "scripts/train.py"]
+
+### Docker Compose
+
+services:
+  quantum-train:
+    build: .
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/workspace/data
+      - ./models:/workspace/models
+    command: python scripts/train.py data/Monday-WorkingHours_50th.csv model_out --backend lightning.gpu
+
+### Prerequisites
+- NVIDIA driver installed on host (590.48.01+)
+- nvidia-container-toolkit installed (for Docker GPU passthrough)
+- Verify with: docker run --gpus all nvidia/cuda:12.0-base nvidia-smi
+
+---
+
+## Project: QuantumNeuralNetworkOS/
+
+Location: repository root
+
+### Directory Structure
+
+QuantumNeuralNetworkOS/
+├── CLAUDE.md
+├── README.md
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── Makefile
+├── config/
+│   ├── __init__.py
+│   ├── defaults.py              # Hyperparams, column removal ranges, constants
+│   └── backends.py              # Backend registry (default.qubit, lightning.qubit, lightning.gpu)
+├── data/
+│   ├── __init__.py
+│   └── pipeline.py              # nPrint CSV ingestion, column removal, feature selection, DataLoader
+├── circuits/
+│   ├── __init__.py
+│   └── model.py                 # Custom QNode (RY encoding + ring CNOT + variational layers + PauliZ/X/Y)
+├── training/
+│   ├── __init__.py
+│   ├── hybrid_model.py          # HybridQuantumNet (nn.Module wrapping TorchLayer + classical head)
+│   └── trainer.py               # Training loop (Adam, FocalLoss with class weights, early stopping, checkpointing)
+├── evaluation/
+│   ├── __init__.py
+│   └── metrics.py               # accuracy, F1, classification_report, confusion_matrix
+├── models/                      # Saved checkpoints (.pt + .json) + training_progress.json
+├── scripts/
+│   ├── train.py                 # CLI: train new model
+│   ├── test.py                  # CLI: evaluate saved model
+│   └── monitor.py               # CLI: monitor training progress from progress JSON
+├── tests/
+│   ├── test_data_pipeline.py
+│   ├── test_circuits.py
+│   ├── test_hybrid_model.py
+│   ├── test_training.py
+│   ├── test_serialization.py
+│   └── test_integration.py
+└── QNNenv/                      # Python 3.12 virtual environment (local dev)
+
+---
+
+## Core Dependencies
+
+# Quantum
+pennylane>=0.39.0
+pennylane-lightning[gpu]>=0.39.0     # GPU simulator (NVIDIA cuQuantum)
+
+# Classical ML
+torch>=2.2.0
+
+# Data
+pandas>=2.0.0
+numpy>=1.26.0,<2.1.0
+scikit-learn>=1.3.0
+scipy>=1.10.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Testing & utilities
+pytest>=7.0.0
+
+---
+
+## Quantum Circuit Architecture
+
+### Feature Encoding
+
+The circuit uses binary nPrint features (0 or 1). No normalization is needed — features are encoded as RY(feature * pi), so 0 maps to |0> and 1 maps to |1>.
+
+Encoding         | PennyLane Op         | Qubits | Features
+---------------- | -------------------- | ------ | --------
+AngleEmbedding   | qml.AngleEmbedding   | 20     | 20 (one RY rotation per qubit)
+
+### Entanglement After Encoding
+
+Ring topology CNOT: qubit i→(i+1) % n_qubits for all i. Creates nearest-neighbor entanglement with wrap-around, allowing correlations between adjacent features to propagate through the ring.
+
+Previously:
+- Run 1-2: linear CNOT chain (q0→q1→q2→...→q19), nearest-neighbor only.
+- Run 3: star topology from q0 (q0→q1, q0→q2, ..., q0→q19). Enabled long-range correlations via q0 hub but prevented direct qubit-to-qubit interaction (qubits 1-19 never directly entangled with each other).
+- Run 4: ring topology. Changed because star topology created a bottleneck -- if features at qubit 8 and qubit 14 together distinguish windows-10-pro from windows-10, star topology cannot learn that correlation directly. Ring allows neighbor correlations to propagate while costing only 1 extra CNOT per layer vs star (20 vs 19).
+
+### Variational Ansatz
+
+Custom ansatz with data re-uploading (not BasicEntanglerLayers). Per layer:
+1. Data re-upload: AngleEmbedding(inputs * pi) re-encodes the raw features (enables universal approximation)
+2. RY(theta) and RZ(phi) on each qubit (2 parameters per qubit per layer)
+3. Star topology CNOT from q0 for entanglement
+
+Previously (Run 1-2): no data re-uploading, linear CNOT chain. Changed in Run 3 — re-uploading breaks the expressivity ceiling that caused both runs to plateau.
+
+Ansatz           | Params per layer | Total params (4 layers, 20 qubits) | Notes
+---------------- | ---------------- | ----------------------------------- | -----
+Custom RY+RZ     | 40               | 160                                 | More expressive than BasicEntanglerLayers (2 rotations vs 1)
+
+This is more expressive than the BasicEntanglerLayers originally planned. RY handles amplitude control, RZ handles phase control, and the CNOT chains entangle qubits — giving the ansatz access to a larger portion of the Hilbert space.
+
+### Measurement
+
+Return qml.expval(PauliZ(i)), qml.expval(PauliX(i)), qml.expval(PauliY(i)) for all 20 qubits. Output: 60 real values in [-1, 1].
+
+Previously (Run 1-3): PauliZ only (20 outputs). Changed in Run 4 — PauliZ measures one "axis" of information per qubit. Adding PauliX and PauliY extracts two additional orthogonal axes, giving the classical head 3x more signal with zero additional gate cost. The quantum state already contains this information; we were simply not reading it.
+
+### Differentiation
+
+diff_method is backend-dependent:
+- default.qubit: backprop (exact, fast for small circuits)
+- lightning.qubit / lightning.gpu: adjoint (memory-efficient, O(1) auxiliary state vectors)
+
+### Circuit Definition (circuits/model.py)
+
+Single file containing the create_circuit() factory function. Returns a QNode with torch interface and a weight_shapes dict for TorchLayer integration.
+
+weight_shapes = {"weights": (n_layers, n_qubits, 2)}  # (4, 20, 2) = 160 params
+
+---
+
+## Data Pipeline (Classical Only)
+
+Reuses OsirisML's nPrint CSV output (962 columns, last column = label).
+
+1. Column removal    -- identical index ranges as OsirisML/QuantumOSClassification, centralized in config/defaults.py
+2. Feature selection -- SelectKBest(mutual_info_classif, k=20), fitted on training set only (no data leakage)
+3. Label encoding    -- LabelEncoder
+4. Train/test split  -- stratified 80/20 split (random_state=42)
+5. Batching          -- PyTorch DataLoader (batch_size=512, num_workers=4, pin_memory=True, persistent_workers=True)
+
+No normalization: nPrint features are binary (0/1), encoded directly as RY(feature * pi).
+
+Output: tensors of shape (batch_size, 20) for features, (batch_size,) for labels.
+
+### Column Removal Ranges (from OsirisML)
+
+Removes IPv4 source/destination addresses, TCP ports, sequence numbers, and acknowledgment numbers to prevent the classifier from memorizing network-specific identifiers:
+
+- Column 0 (index)
+- Columns 97-129 (IPv4 src)
+- Columns 130-160 (IPv4 dst)
+- Columns 33-48 (TCP src/dst ports)
+- Columns 480-496 (TCP seq numbers)
+- Columns 496-512 (TCP ack numbers)
+- Columns 512-544 (additional)
+- Columns 544-576 (additional)
+
+Reference files:
+- Column ranges:     OsirisML/model/xgboostmodel.py
+- Feature selection:  QuantumOSClassification/quantum_os_classifier.py
+
+---
+
+## Training Architecture (Quantum)
+
+### Hybrid Model (HybridQuantumNet)
+
+Input (20) -> TorchLayer(QNode) -> [60 expectation values (Z+X+Y)] -> Linear(60, 128) -> ReLU -> Dropout(0.3) -> Linear(128, n_classes) -> logits
+
+qml.qnn.TorchLayer wraps the QNode as a standard nn.Module, so PyTorch handles all gradient computation automatically via adjoint differentiation on the quantum side and standard autograd on the classical side.
+
+Previously (Run 1-3): 20 PauliZ outputs -> Linear(20, 64) -> ReLU -> Linear(64, 12). Changed in Run 4 to handle 60 measurement outputs and provide more capacity for fine-grained class discrimination. Dropout(0.3) prevents overfitting with the larger head.
+
+### Parameter Count
+
+Component        | Parameters
+---------------- | ----------
+Quantum layer    | 160 (4 layers x 20 qubits x 2 rotations)
+Linear(60, 128)  | 7,808 (60*128 + 128 bias)
+Dropout(0.3)     | 0
+Linear(128, 12)  | 1,548 (128*12 + 12 bias)
+**Total**        | **9,516**
+
+### Training Config
+
+Setting              | Value                            | Reason
+-------------------- | -------------------------------- | ------
+Ansatz               | Custom RY+RZ (n_layers=4)        | More expressive than BasicEntanglerLayers
+Optimizer            | Adam (lr=0.005)                  | Gradient-based, works with adjoint diff
+LR warmup            | 3 epochs (lr/10 -> lr)           | Prevents large destructive updates before model finds a stable basin
+LR scheduler         | ReduceLROnPlateau(0.5, patience=5) | Halves LR when val_f1 stalls for 5 epochs
+LR floor             | 1e-5                             | Prevents LR from decaying to zero
+Gradient clipping    | max_norm=0.75                    | Caps gradient magnitude; middle ground between 0.5 (starved gradients) and 1.0 (allowed collapses)
+Loss                 | FocalLoss (class-weighted, gamma=2.0) | Focal modulation focuses gradients on hard/confusable examples; inverse-frequency weights handle class imbalance (implemented Run 5+; Runs 1-3 used CrossEntropyLoss, Run 4 used FocalLoss but with bad features)
+Batch size           | 512                              | 8x reduction in batches per epoch vs original 64
+Early stopping       | patience=10 on val F1            | Stops training when model plateaus
+Checkpointing        | Best model per epoch (by val F1) | Saves .pt weights + .json config
+Backend              | lightning.gpu (RTX 3090)         | Adjoint differentiation on GPU
+
+### Focal Loss with Class Weights
+
+Loss function: FocalLoss(weight=class_weights, gamma=2.0)
+  FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+Class weights use inverse-frequency weighting: weight_i = (1 / count_i) normalized so weights sum to n_classes. This compensates for class imbalance (e.g., ubuntu-web-server at 1.7% of training data vs majority classes at 15%+).
+
+Focal modulation (gamma=2.0) down-weights easy, well-classified examples and up-weights hard, confusable examples. This addresses class confusion (Windows variants with near-identical fingerprints) on top of class imbalance.
+
+Previously (Run 1-3): nn.CrossEntropyLoss(weight=class_weights). Changed in Run 4 because weighted CE treats all predictions equally within a class -- the model was getting high reward for easy Mac/Ubuntu classifications while barely being penalized for confusing Windows variants.
+
+### Training Observability
+
+1. **Startup**: data pipeline timing, class distribution with percentages, batch counts, model build time, parameter count (quantum vs classical)
+2. **Batch progress** (every 10 batches): running average loss, batch time, epoch ETA
+3. **Gradient norms** (every 50 batches): quantum layer and classical head norms reported separately, CLIPPED flag when clipping activates
+4. **Per-class F1** (every epoch): F1 for each class index, WARNING for any class with F1=0.0
+5. **Timing** (every epoch): train vs validation time split
+6. **Progress JSON** (atomic writes): training_progress.json in models/ for external monitoring via scripts/monitor.py
+
+All output uses print(..., flush=True) for Docker log compatibility.
+
+### Key Advantage Over Qiskit
+
+                  | Qiskit (current)              | PennyLane + PyTorch (this project)
+----------------- | ----------------------------- | -----------------------------------
+Optimizer         | COBYLA (gradient-free)         | Adam (gradient-based)
+Batching          | Full dataset per iteration     | Mini-batches via DataLoader
+Gradient source   | None                           | Adjoint (GPU) or backprop (CPU)
+Simulation        | CPU only                       | GPU-accelerated (cuQuantum on RTX 3090)
+Features/Qubits   | 4                              | 20
+Hilbert space     | 16 dimensions                  | ~1 million dimensions
+
+---
+
+## Backend Abstraction
+
+A registry in config/backends.py maps backend names to PennyLane device configs:
+
+Backend         | Device          | diff_method | Use case
+--------------- | --------------- | ----------- | --------
+default.qubit   | default.qubit   | backprop    | Quick prototyping, unit tests (CPU, no install needed)
+lightning.qubit  | lightning.qubit | adjoint     | Fast CPU simulation (fallback when no GPU)
+lightning.gpu    | lightning.gpu   | adjoint     | GPU production on RTX 3090 (default)
+
+CLI usage: python scripts/train.py data.csv model --backend lightning.gpu
+
+The default backend is lightning.gpu. CPU backends are available as fallback for environments without a GPU.
+
+---
+
+## Model Serialization
+
+Two files per model:
+- {name}.pt   -- PyTorch state dict (quantum + classical weights)
+- {name}.json -- circuit config + preprocessing metadata (n_qubits, n_layers, n_features, n_classes, feature_indices, label_classes, backend)
+
+JSON config is used by load_checkpoint() to reconstruct the model architecture before loading weights. This allows the test script to rebuild the exact model without knowing the original training arguments.
+
+---
+
+## Training Data
+
+### Dataset
+
+nPrint CSV from CIC-IDS2017 Monday Working Hours capture (benign traffic only).
+
+- **Total samples**: 2,694,733 (80/20 split: 2,155,786 train / 538,947 test)
+- **Features**: 962 columns (961 binary nPrint features + 1 OS label)
+- **After column removal + SelectKBest**: 20 binary features
+
+### Classes (12 operating systems)
+
+Class                  | Description
+---------------------- | -----------
+mac_mac-os-x           | macOS
+ubuntu-14.4-32b        | Ubuntu 14.04 32-bit
+ubuntu-14.4-64b        | Ubuntu 14.04 64-bit
+ubuntu-16.4-32b        | Ubuntu 16.04 32-bit
+ubuntu-16.4-64b        | Ubuntu 16.04 64-bit
+ubuntu-ubuntu-server   | Ubuntu Server
+ubuntu-web-server      | Ubuntu Web Server (minority class, ~1.7%)
+windows-10             | Windows 10
+windows-10-pro         | Windows 10 Pro
+windows-7-pro          | Windows 7 Pro
+windows-8.1            | Windows 8.1
+windows-vista          | Windows Vista
+
+The dataset has significant class imbalance (up to ~15.5x ratio between largest and smallest classes), addressed by inverse-frequency class weighting in the loss function.
+
+---
+
+## Monitoring
+
+### Progress JSON (training_progress.json)
+
+Written atomically (tmp file + os.replace) to models/training_progress.json every 10 batches, at validation start, and at epoch end. Contains phase, epoch, batch, loss, timing, best F1, and learning rate.
+
+### Monitor Script (scripts/monitor.py)
+
+# One-shot check
+docker exec <container> python scripts/monitor.py models
+
+# Watch mode (updates every 30s)
+docker exec <container> python scripts/monitor.py models --watch
+
+# From host (since models/ is volume-mounted)
+python QuantumNeuralNetworkOS/scripts/monitor.py QuantumNeuralNetworkOS/models
+
+---
+
+## Verification Plan
+
+1. Unit tests:          pytest tests/ -- circuit construction, data pipeline, gradient flow, serialization roundtrip
+2. Gradient flow test:  verify quantum_layer weights.grad is not None after loss.backward()
+3. Integration test:    synthetic 20-feature multi-class data through full pipeline (load -> encode -> train 3 epochs -> predict -> evaluate)
+4. Baseline comparison: train on same OsirisML CSV data with same train/test split, compare accuracy/F1 with QuantumOSClassification (Qiskit) and OsirisML (XGBoost) results
+5. Docker test:         build image, run training inside container with --gpus all, verify GPU is used via nvidia-smi
+6. Fallback test:       verify same model trains on lightning.qubit (CPU) when GPU is unavailable
+
+### Test Files
+
+- tests/test_data_pipeline.py   -- CSV loading, column removal, feature selection
+- tests/test_circuits.py        -- circuit construction, output shape, gate count
+- tests/test_hybrid_model.py    -- forward pass, gradient flow
+- tests/test_training.py        -- training loop, early stopping, checkpointing
+- tests/test_serialization.py   -- save/load model + config roundtrip
+- tests/test_integration.py     -- synthetic data through full pipeline
+
+---
+
+## Implementation Order
+
+ 1. Dockerfile + docker-compose.yml               -- Docker environment with GPU support
+ 2. config/defaults.py + config/backends.py        -- constants and backend registry (default: lightning.gpu)
+ 3. data/pipeline.py                                -- nPrint CSV ingestion (classical preprocessing)
+ 4. circuits/model.py                               -- Custom QNode (20-qubit RY encoding + RY/RZ variational layers)
+ 5. training/hybrid_model.py                        -- HybridQuantumNet (nn.Module + TorchLayer)
+ 6. training/trainer.py                             -- training loop with early stopping, LR scheduling, gradient clipping
+ 7. evaluation/metrics.py                           -- accuracy, F1, classification_report
+ 8. scripts/train.py + test.py + monitor.py         -- CLI entrypoints
+ 9. tests/                                          -- all test files
+10. requirements.txt + Makefile + README.md + CLAUDE.md
+
+---
+
+## Issues Encountered & Decisions
+
+### Issue 1: PyTorch CUDA Driver Mismatch
+
+**Problem**: The PennyLane Docker image (pennylaneai/pennylane:latest-lightning-gpu) ships PyTorch 2.11.0+cu130, compiled for CUDA 13.0. The host NVIDIA driver (570.211.01) only supports up to CUDA 12.8. Result: torch.cuda.is_available() = False. PyTorch's backward pass for the classical head falls back to CPU entirely.
+
+**Key insight**: PennyLane's lightning.gpu backend has its own CUDA bindings separate from PyTorch, so the quantum circuit still runs on the GPU. Only PyTorch is affected. The quantum circuit forward/backward (adjoint differentiation) runs on GPU; the classical optimizer step and loss computation run on CPU.
+
+**Decision**: Upgrade host NVIDIA driver from 570.211.01 to 590.48.01 (available in Ubuntu 24.04 repos). Driver 590 supports CUDA 13.x, which matches the container's PyTorch. Preferred over pinning PyTorch to cu128 because it keeps the full stack current.
+
+**Status**: Driver 590.48.01 installed.
+
+### Issue 2: vLLM Server Consuming GPU Memory
+
+**Problem**: A vLLM inference server (Docker container) was consuming 22,126 MiB of the RTX 3090's 24,576 MiB VRAM, leaving only ~700 MiB for quantum training.
+
+**Key insight**: nvidia-smi showed 91% GPU utilization, which was misleading — utilization measures "% of time a kernel is running," not throughput. The 20-qubit state vector is only ~16 MB, so VRAM was not the bottleneck. Training ran at 27s/batch regardless.
+
+**Decision**: Stop the vLLM server during training runs. While it didn't directly affect per-batch speed for this circuit size, sharing the GPU adds scheduling overhead and would matter for larger circuits.
+
+### Issue 3: Training Speed — Batch Size Too Small
+
+**Problem**: With batch_size=64 and 2,155,786 training samples, each epoch requires 33,685 batches. At ~27s/batch, one epoch takes ~10.5 days. 50 epochs would take ~1.4 years.
+
+**Root cause**: The quantum circuit processes samples sequentially (not batched at the GPU level). Each batch means 64 sequential circuit evaluations + 1 weight update. More batches = more overhead.
+
+**Decision**: Increase batch_size from 64 to 512 (8x fewer batches per epoch: 33,685 -> 4,211).
+
+**Why 512 and not 1024**:
+- Quantum circuits process samples one at a time, so larger batches don't parallelize the forward pass
+- 1024 requires more aggressive learning rate scaling, risking instability
+- With 12 classes (some rare), 512 provides enough samples per batch for stable gradient estimates
+- 512 is conservative enough to avoid LR tuning issues while still providing 8x speedup
+
+### Issue 4: Linear LR Scaling Failed
+
+**Problem**: The batch_size 64->512 change originally used the linear scaling rule (LR proportional to batch size: 0.01 -> 0.08). Val F1 oscillated wildly (0.29 -> 0.16 -> 0.30 -> 0.16).
+
+**Root cause**: The linear scaling rule assumes gradient variance decreases proportionally with batch size. This holds for classical networks but not quantum circuits:
+1. Quantum gradients from adjoint differentiation on a 2^20-dimensional state vector — small angle changes in RY/RZ gates can flip interference patterns
+2. 160 variational parameters create a highly non-convex landscape with narrow valleys
+3. With 12 classes and 15.5x class imbalance, inverse-frequency weighting amplifies rare-class gradients
+
+**Decision**: Reverted LR to 0.01. Added LR warmup (3 epochs, linear ramp from lr/10 to lr), ReduceLROnPlateau scheduler (halve on 3-epoch stall), and gradient clipping (max_norm=1.0).
+
+### Issue 5: DataLoader Not Parallelized
+
+**Problem**: PyTorch DataLoader defaulted to num_workers=0 (single-threaded, blocking). GPU sits idle while the next batch is prepared.
+
+**Decision**: Set num_workers=4 (train) / 2 (test), pin_memory=True, persistent_workers=True.
+
+### Issue 6: tqdm Output Buffering in Docker
+
+**Problem**: tqdm progress bars use \\r (carriage return) for in-place updates. Docker containers run without a TTY, so tqdm output was garbled in docker logs.
+
+**Decision**: Removed tqdm entirely. Replaced with plain batch logger printing every 10 batches to stdout with flush=True. Works correctly with Docker logs, tee, and tmux.
+
+### Issue 7: VS Code Ripgrep Consuming CPU
+
+**Problem**: VS Code's built-in ripgrep file indexer crawled the 9GB+ data directory, consuming 200-1200% CPU.
+
+**Decision**: Added data directory exclusions to .vscode/settings.json (files.watcherExclude, search.exclude, files.exclude).
+
+### Issue 8: Docker Build Context Too Large
+
+**Problem**: Docker COPY . . copies the entire project directory (including 9GB of CSV data) into the build context.
+
+**Recommendation**: Add data/*.csv to .dockerignore. Data should only be accessed via the volume mount.
+
+### Issue 9: Insufficient Training Visibility
+
+**Problem**: Only per-epoch loss and val_f1 were logged. No gradient norms, no per-class F1, no timing breakdown.
+
+**Decision**: Added structured logging:
+1. Startup: data pipeline timing, class distribution, parameter counts
+2. Gradient norms every 50 batches (quantum vs classical, with CLIPPED flag)
+3. Per-class F1 every epoch with WARNING for zero-F1 classes
+4. Train vs validation timing split per epoch
+5. Class weights at init with min/max/ratio
+6. Progress JSON for external monitoring
+
+---
+
+## Training Config History
+
+### Original Config (2026-04-05)
+
+Setting          | Value
+---------------- | -----
+batch_size       | 64
+learning_rate    | 0.01
+num_workers      | 0
+pin_memory       | False
+NVIDIA driver    | 570.211
+
+### After Batch Size Optimization
+
+Setting          | Value   | Reason
+---------------- | ------- | ------
+batch_size       | 512     | 8x fewer batches per epoch
+learning_rate    | 0.08    | Linear scaling with batch size
+num_workers      | 4       | Parallel data loading
+pin_memory       | True    | Faster CPU->GPU transfer
+persistent_workers | True  | Avoid worker respawn overhead
+PYTHONUNBUFFERED | 1       | Flush Python stdout immediately
+NVIDIA driver    | 590.48  | CUDA 13.0 support for PyTorch
+
+### After LR Stabilization
+
+Setting            | Value                      | Reason
+------------------ | -------------------------- | ------
+learning_rate      | 0.01                       | 0.08 caused val_f1 oscillation; quantum loss landscapes too noisy
+lr_warmup          | 3 epochs (lr/10 -> lr)     | Prevents destructive updates before model finds stable basin
+lr_scheduler       | ReduceLROnPlateau(0.5, p=3) | Halves LR when val_f1 stalls
+lr_min             | 1e-5                       | Floor for LR reduction
+gradient_clipping  | max_norm=1.0               | Caps gradient magnitude
+
+### Run 1 Results (Monday-WorkingHours_50th.csv, 2026-04-05 to 2026-04-15)
+
+Trained 13 completed epochs over ~167 hours on the 50th percentile dataset (2,694,733 samples, imbalanced classes).
+
+Epoch | Loss   | Accuracy | Val F1 | LR     | Notes
+----- | ------ | -------- | ------ | ------ | -----
+1     | 2.2748 | 31.1%    | 0.1789 | 0.0010 | Warmup (lr/10)
+2     | 1.6971 | 39.9%    | 0.3101 | 0.0055 | Warmup ramp
+3     | 1.5840 | 36.6%    | 0.2841 | 0.0100 | Full LR reached
+4     | 1.5667 | 41.1%    | 0.3209 | 0.0100 |
+5     | 1.5566 | 38.6%    | 0.3110 | 0.0100 |
+6     | 1.5522 | 24.2%    | 0.1957 | 0.0100 | Catastrophic collapse
+7     | 1.5498 | 38.9%    | 0.3163 | 0.0100 | Recovery
+8     | 1.5470 | 19.7%    | 0.1864 | 0.0100 | Catastrophic collapse
+9     | 1.5385 | 42.8%    | 0.3466 | 0.0050 | LR halved by scheduler, best so far
+10    | 1.5370 | 42.3%    | 0.3424 | 0.0050 |
+11    | 1.5352 | 39.1%    | 0.3213 | 0.0050 |
+12    | 1.5351 | 41.7%    | 0.3336 | 0.0050 |
+13    | 1.5334 | 42.9%    | 0.3483 | 0.0050 | Best F1
+
+Run stopped at epoch 14 (batch 30/169). Best result: 42.9% accuracy / 0.3483 F1 at epoch 13.
+
+Observations:
+- Catastrophic collapses at epochs 6 and 8 (accuracy dropped to 24% and 20%) caused by bad gradient updates at LR=0.01
+- LR halving to 0.005 at epoch 9 immediately stabilized training and produced all best results
+- Loss plateaued at ~1.535 for 5 epochs — model at capacity ceiling
+- Per-class F1 wildly inconsistent: class 0 (mac) at 0.86 while classes 8, 9, 10 bounced between 0.03-0.24
+- Quantum gradient norms low (0.08-0.14) vs classical (0.16-0.29) — quantum params barely updating
+- 15.5x class imbalance amplified rare-class gradient noise
+
+### Run 2 Results (Monday-WorkingHours_balanced_11th.csv, 2026-04-15 to 2026-04-21)
+
+Trained 11 completed epochs over ~134 hours on the balanced 11th percentile dataset (82,497 training / 20,625 test samples, 12 balanced classes).
+
+Epoch | Loss   | Accuracy | Val F1 | LR     | Notes
+----- | ------ | -------- | ------ | ------ | -----
+1     | 2.4272 | 16.8%    | 0.0632 | 0.0003 | Warmup (lr/10)
+2     | 1.9465 | 25.5%    | 0.1745 | 0.0010 | Warmup ramp
+3     | 1.6651 | 27.7%    | 0.2207 | 0.0017 | Warmup ramp
+4     | 1.5753 | 31.9%    | 0.2652 | 0.0023 | Warmup ramp
+5     | 1.5253 | 32.5%    | 0.2739 | 0.0030 | Full LR reached
+6     | 1.5152 | 33.1%    | 0.2775 | 0.0030 |
+7     | 1.5098 | 33.6%    | 0.2900 | 0.0030 |
+8     | 1.5059 | 32.1%    | 0.2686 | 0.0030 |
+9     | 1.5025 | 33.9%    | 0.2855 | 0.0030 |
+10    | 1.5008 | 34.4%    | 0.2946 | 0.0030 | Best F1
+11    | 1.4983 | 33.8%    | 0.2810 | 0.0030 |
+
+Run stopped manually at epoch 12 (in progress). Best result: 34.4% accuracy / 0.2946 F1 at epoch 10.
+
+Per-class F1 at best epoch (10): 0:0.85 1:0.28 2:0.33 3:0.26 4:0.30 5:0.29 6:0.53 7:0.37 8:0.01 9:0.03 10:0.29 11:0.00
+
+Observations:
+- No catastrophic collapses (tighter gradient clipping at 0.5 and lower LR worked as intended)
+- But model plateaued much earlier and at lower F1 than Run 1 (0.2946 vs 0.3483)
+- Loss barely moved across epochs 5-11 (1.5253 → 1.4983, delta of 0.027 over 7 epochs)
+- LR scheduler never triggered — LR stayed at 0.003 for all post-warmup epochs
+- 5-epoch warmup wasted ~2.5 days training at near-useless learning rates (0.0003-0.003)
+- Quantum gradient norms very low (0.03-0.16) vs classical (0.11-0.35) — quantum params barely updating
+- Class 11 stuck at F1=0.0 for 8 consecutive epochs (since epoch 3)
+- Classes 8 and 9 oscillated wildly between 0.0 and 0.35 across epochs
+- Balanced dataset did not improve per-class F1 consistency as expected
+- Accuracy ceiling ~34% vs Run 1's ~43% — significant regression despite parameter tuning
+
+### After Run 2 Analysis — Circuit Architecture + Optimizer Tuning (2026-04-21)
+
+Run 2 regressed significantly from Run 1 (0.2946 vs 0.3483 F1) despite eliminating catastrophic collapses. Two categories of changes for Run 3: circuit architecture (expressivity) and hyperparameter tuning (optimizer).
+
+#### Problem: Expressivity Ceiling
+
+Both runs plateaued hard — Run 1 at loss ~1.535, Run 2 at ~1.50. The loss barely moved across many epochs despite healthy gradient norms on the classical side. This pattern points to an expressivity ceiling in the quantum circuit, not just an optimizer problem.
+
+Root causes identified:
+
+1. **Linear CNOT topology limits long-range correlations**: The nearest-neighbor chain (q0→q1→q2→...→q19) means features encoded on distant qubits (e.g., TTL bit at q0 and TCP window bit at q17) can only interact after information hops through the full chain. With 4 layers, correlations build slowly. For OS fingerprinting, feature correlations are global — TTL patterns need to interact directly with TCP option patterns.
+
+2. **Single data encoding limits function class**: The circuit only sees the input features once at the start. After AngleEmbedding, the variational layers operate on a fixed encoded state. This limits the circuit to learning functions that are essentially first-order Fourier series of the input — only linear decision boundaries per layer. With 12 OS classes sharing similar binary feature patterns, linear boundaries are insufficient.
+
+#### Decision: Star Topology Entanglement
+
+Replace both CNOT blocks (post-encoding and per-layer) with star topology from q0:
+
+Before: for i in range(n_qubits - 1): qml.CNOT(wires=[i, i + 1])
+After:  for i in range(1, n_qubits): qml.CNOT(wires=[0, i])
+
+q0 becomes a global control qubit — every other qubit gets directly entangled with it in one pass instead of hopping through the chain. Gate count stays identical (19 CNOTs), zero extra parameters. q0 carries ipv4_ttl_1 (MI=0.6773, the strongest feature), so making it the hub means every qubit gets direct entanglement with the most discriminative signal.
+
+No Hadamard on q0 needed — that's only for GHZ state preparation from |0⟩. After AngleEmbedding, q0 is already rotated by the data, so the star CNOTs create entanglement directly.
+
+Trade-off: qubits 1-19 no longer directly interact with each other (only through q0). With 4 layers of re-uploading this should propagate information sufficiently, but if mid-range features (tcp_opt bits at q3-q6) show F1 regression, this topology may need revisiting.
+
+#### Decision: Data Re-uploading
+
+Add AngleEmbedding at the start of each variational layer:
+
+for layer in range(n_layers):
+    qml.AngleEmbedding(inputs * np.pi, wires=range(n_qubits), rotation="Y")  # re-upload
+    for i in range(n_qubits):
+        qml.RY(weights[layer, i, 0], wires=i)
+        qml.RZ(weights[layer, i, 1], wires=i)
+    for i in range(1, n_qubits):
+        qml.CNOT(wires=[0, i])
+
+This gives the circuit universal approximation capability (Pérez-Salinas et al., 2020). Each layer now sees the raw input features again, allowing the variational rotations to learn non-linear interactions with the data at each depth level. Zero extra trainable parameters — only adds 20 RY gates per layer (data-driven, not learned).
+
+Combined with star topology, this means: every layer re-encodes the data, applies learned rotations, then entangles all qubits through q0. The circuit can now learn progressively more complex decision boundaries at each layer depth.
+
+#### Hyperparameter Changes
+
+Setting            | Value                      | Was (Run 2) | Reason
+------------------ | -------------------------- | ----------- | ------
+dataset            | Monday-WorkingHours_50th.csv | Monday-WorkingHours_balanced_11th.csv | Imbalanced + class weights outperformed balanced (0.3483 vs 0.2946 F1)
+learning_rate      | 0.005                      | 0.003       | Run 1's best epochs were all at LR=0.005 (after scheduler halved from 0.01)
+lr_warmup          | 3 epochs                   | 5           | 5 wasted ~2.5 days at near-useless LRs; 3 epochs from 0.0005→0.005
+gradient_clipping  | max_norm=0.75              | 0.5         | 0.5 starved gradients (quantum norms 0.03-0.16), 1.0 allowed collapses; 0.75 is the middle ground
+lr_scheduler_patience | 5 epochs                | 3           | More time at each LR level before halving; avoids premature reduction
+classical_head     | Linear(20,64)->ReLU->Linear(64,12) | same | Kept from Run 2
+patience           | 10 epochs                  | same        | Kept from Run 2
+
+#### Warm Start Decision (evaluated, rejected)
+
+Considered loading Run 1's quantum weights as initialization. Rejected because:
+- Classical head shape mismatch: Run 1 had Linear(20,32), Run 3 has Linear(20,64) — would need surgical loading of quantum weights only
+- Feature space shift: different dataset means different SelectKBest top-20 features — the quantum weights learned for one feature ordering are meaningless for another
+- Circuit architecture changed: star topology + re-uploading means the old weights were optimized for a fundamentally different circuit structure
+- The 3-epoch LR warmup already provides most of what warm start would give (gentle ramp into the loss landscape)
+
+#### Gate Count Change
+
+Component       | Before (Run 1-2) | After (Run 3) | Delta
+--------------- | ---------------- | ------------- | -----
+Encoding        | 20 RY            | 20 RY         | same
+Post-encoding   | 19 CNOT          | 19 CNOT       | same (star vs linear)
+Per-layer       | 20 RY + 20 RZ + 19 CNOT | 20 RY (re-upload) + 20 RY + 20 RZ + 19 CNOT | +20 RY per layer
+Total per layer | 59               | 79            | +20
+Total circuit   | 275              | 355           | +80 gates
+
+80 additional data-encoding gates (no trainable parameters). Expect modest per-batch slowdown from the extra gate operations on the state vector.
+
+### After Run 1 Analysis — Balanced Dataset + Optimizer Tuning (2026-04-15)
+
+Changes made based on Run 1 analysis. All changes are zero-cost per batch (no increase in training time).
+
+Setting            | Value                      | Was     | Reason
+------------------ | -------------------------- | ------- | ------
+dataset            | Monday-WorkingHours_balanced_11th.csv | Monday-WorkingHours_50th.csv | Balanced classes (~8,500 per class) eliminate imbalance noise; 103K samples vs 2.7M (26x smaller, faster epochs)
+learning_rate      | 0.003                      | 0.01    | Run 1 showed lower LR = better results; 0.01→0.005 halving immediately produced best epochs
+gradient_clipping  | max_norm=0.5               | 1.0     | Tighter clipping prevents catastrophic collapses seen at epochs 6 and 8
+classical_head     | Linear(20,64)->ReLU->Linear(64,12) | Linear(20,32)->ReLU->Linear(32,12) | Doubles classical capacity (2,124 vs 1,068 params) at zero compute cost; helps separate quantum embeddings
+lr_warmup          | 5 epochs                   | 3       | Longer ramp from lr/10 to lr gives quantum params more time to find stable basin at lower starting LR
+patience           | 10 epochs                  | 7       | Lower LR means slower improvement — don't trigger early stopping prematurely
+
+Total parameters: 160 quantum + 2,124 classical = 2,284 (was 1,228). (Updated in Run 4: 160 quantum + 8,844 classical = 9,004.)
+
+Class weights are effectively uniform on balanced data (min=0.980, max=1.021, ratio=1.0x). Kept for code consistency but functionally equivalent to unweighted loss.
+
+Top 20 features by mutual information (balanced dataset):
+
+Rank | Feature       | MI Score | Description
+---- | ------------- | -------- | -----------
+1    | ipv4_ttl_1    | 0.6773   | TTL bit 1 — dominant OS signal (Linux=64, Windows=128)
+2    | ipv4_ttl_0    | 0.6580   | TTL bit 0
+3    | tcp_opt_34    | 0.3908   | TCP options (MSS, window scale, SACK, timestamps)
+4    | tcp_opt_40    | 0.3891   | TCP options
+5    | tcp_opt_36    | 0.3881   | TCP options
+6-20 | tcp_opt/doff  | 0.28-0.35 | Mix of TCP options bits and TCP data offset bits
+
+No sharp MI score dropoff at k=20 (feature 20: 0.2745, feature 30: 0.2676). Supports future experiment with k=25-30 if model capacity is still a bottleneck.
+
+Changes NOT made (evaluated, deferred):
+- More variational layers (4→6-8): most impactful capacity fix but ~2x training time per batch. Deferred until zero-cost changes are evaluated.
+- Increase k to 25-30 qubits: exponentially larger state vector (16 MB → 512 MB+). Deferred — requires profiling.
+- Continuous features: biggest potential upside but requires different data source. Architectural change for future.
+- Drop class weights: functionally identical on balanced data (ratio=1.0x). Not worth a restart.
+- Switch to macro-F1: numerically identical to weighted-F1 on balanced data. Not worth a restart.
+
+---
+
+## Run Procedure
+
+1. Ensure vLLM server is stopped: docker stop vllm-server
+2. Start training in tmux with log streaming: tmux new-session -d -s training "docker compose up --build 2>&1 | tee training.log"
+3. Monitor: tmux attach -t training, or tail -f training.log, or docker compose logs -f quantum-train
+4. Monitor progress JSON: python scripts/monitor.py models --watch
+5. Check GPU: nvidia-smi
+
+---
+
+## Commands
+
+# Train
+python scripts/train.py data/nprint.csv model_out --backend lightning.gpu
+
+# Evaluate saved model
+python scripts/test.py data/nprint.csv models/model_out --backend lightning.gpu
+
+# Unit tests
+pytest tests/ -v
+
+# Docker build + run
+docker compose up quantum-train
+
+# Monitor training
+python scripts/monitor.py models --watch
+
+# Makefile shortcuts
+make train                          # default: lightning.gpu
+make test
+make unit-test
+make docker-build
+make docker-run
+make clean
+
+
+  Problem 1: Extreme Volatility                                                                                                       
+   
+  Epochs 6 and 8 crashed to 24% and 19% accuracy, then recovered. That's the model periodically collapsing — likely a few bad gradient
+   updates sending the quantum parameters into a destructive interference pattern. With only 160 parameters on a noisy landscape, one
+  bad step can be catastrophic.                                                                                                       
+                                                                                                                                    
+  Recommendations:
+  - Lower the learning rate further (0.003 or 0.001) — the 0.01→0.005 drop immediately produced the best epoch (9). A lower LR means
+  slower convergence but fewer catastrophic jumps                                                                                     
+  - Increase gradient clipping from max_norm=1.0 to 0.5 — tighter clipping would have prevented those epoch 6/8 collapses
+  - Cosine annealing scheduler instead of ReduceLROnPlateau — smoother LR decay avoids the sudden halving transitions                 
+                                                                                                                                      
+  Problem 2: Model Capacity                                                                                                           
+                                                                                                                                      
+  160 quantum parameters + 1,068 classical parameters trying to separate 12 classes with only 20 binary features. The model may simply
+   not have enough expressivity.                                                                                                    
+                                                                                                                                      
+  Recommendations:                                                                                                                  
+  - Increase variational layers from 4 to 6 or 8 (240 or 320 quantum params) — more layers = access to more of the Hilbert space
+  - Larger classical head — Linear(20, 64) → ReLU → Linear(64, 12) instead of going through 32. The classical head is cheap and could 
+  help separate the quantum embeddings better                                                                                        
+  - Increase k in SelectKBest from 20 to 25 or 30 — more features means more qubits and exponentially larger Hilbert space (though    
+  training gets slower)                                                                                                             
+                                                                                                                                      
+  Problem 3: 20 Binary Features May Not Be Enough                                                                                   
+                                                                                                                                      
+  SelectKBest with k=20 aggressively reduces from 961 features. The mutual information scores for features 21-30 might still carry    
+  useful signal that's being thrown away.
+                                                                                                                                      
+  Recommendation:                                                                                                                   
+  - Check the mutual_info_classif scores — if features 20-30 have scores close to features 15-20, you're losing valuable information.
+  If there's a sharp dropoff after 20, then k=20 is fine                                                                              
+                                                        
+  Problem 4: Binary Features Underutilize Angle Encoding                                                                              
+                                                                                                                                      
+  RY(0) = |0⟩ and RY(π) = |1⟩ — you're only using two points on the Bloch sphere. The circuit has the expressivity to handle          
+  continuous features but you're feeding it binary inputs.                                                                            
+                                                                                                                                      
+  Recommendation:                                                                                                                   
+  - Try continuous features instead of binary nPrint — if you have raw packet header values (e.g., TTL, window size, MSS), continuous
+  angle encoding would give the quantum circuit much more to work with. This is a bigger architectural change though                  
+                                                                                                                    
+  Quickest Wins (least effort, most likely impact)                                                                                    
+                                                                                                                                      
+  1. Tighten gradient clipping to 0.5 — prevents the catastrophic drops
+  2. More variational layers (6-8) — more expressivity with minimal code change
+  3. Lower starting LR to 0.003 — the data already shows lower LR = better results
+
+### Run 3 Results (Monday-WorkingHours_50th.csv, 2026-04-21 to 2026-05-07)
+
+Trained 26 completed epochs over ~2 weeks on the 50th percentile dataset (2,694,733 samples, imbalanced classes). Circuit changes: star topology + data re-uploading. Hyperparameter changes: LR=0.005, warmup=3, grad_clip=0.75, classical_head=Linear(20,64)->ReLU->Linear(64,12).
+
+Epoch | Loss   | Accuracy | Val F1 | LR     | Notes
+----- | ------ | -------- | ------ | ------ | -----
+1     | 2.3213 | 18.7%    | 0.1194 | 0.0005 | Warmup
+2     | 1.6756 | 39.1%    | 0.2963 | 0.0028 | Warmup ramp
+3     | 1.5965 | 37.1%    | 0.2933 | 0.0050 | Full LR reached
+...
+9     | 1.5455 | 21.4%    | 0.2057 | 0.0050 | Accuracy dip (instability)
+...
+15    | 1.5357 | 20.1%    | 0.1906 | 0.0050 | Accuracy dip (instability)
+...
+24    | 1.5287 | 43.2%    | 0.3503 | 0.0050 | Best accuracy
+25    | 1.5277 | 42.9%    | 0.3478 | 0.0050 | Best loss
+26    | 1.5282 | 43.0%    | 0.3510 | 0.0050 | Best F1
+
+Best result: 43.2% accuracy / 0.3510 F1 at epoch 26.
+
+Per-class F1 at best epoch (26): 0:0.86 1:0.30 2:0.40 3:0.31 4:0.30 5:0.26 6:0.20 7:0.59 8:0.04 9:0.05 10:0.27 11:0.01
+
+Observations:
+- Marginal improvement over Run 1 (0.3510 vs 0.3483 F1), mainly from star topology + re-uploading
+- No catastrophic collapses to <20% accuracy (gradient clipping 0.75 worked), but two instability dips at epochs 9 and 15
+- Model PLATEAUED: loss dropped only 0.03 over last 15 epochs (1.5455→1.5277)
+- Classes 8 (windows-10-pro), 9 (windows-7-pro), 11 (windows-vista) stuck at near-zero F1 (0.04, 0.05, 0.01)
+- These are NOT minority classes: class 8 = 23.2% of training data (2nd largest class)
+- Root cause: CLASS CONFUSION, not imbalance. Windows variants have near-identical network fingerprints
+- Evidence: epochs 3-5 showed class 7 and class 8 trading off F1 scores (when one improves, the other collapses)
+- The model settled on predicting class 7 (windows-10) for most Windows packets, ignoring classes 8, 9, 11
+- Quantum gradient norms stable (0.03-0.06), classical healthy (0.19-0.28)
+- Star topology bottleneck: all information routes through q0, preventing direct qubit-to-qubit correlations needed to distinguish similar classes
+
+### After Run 3 Analysis — Architecture Overhaul for Class Confusion (2026-05-07)
+
+Run 3 plateaued at val_F1=0.3510 with classes 8, 9, 11 (all Windows variants) at near-zero F1. Root cause: class confusion, not imbalance. Five changes for Run 4, all with approximately zero additional compute per batch:
+
+#### Problem: Class Confusion
+
+Classes 8 (windows-10-pro, 23.2%), 9 (windows-7-pro, 5.0%), and 11 (windows-vista, 3.6%) together represent 31.74% of training data but have F1 scores of 0.04, 0.05, and 0.01. The model cannot distinguish Windows variants with near-identical network fingerprints.
+
+Evidence from training logs:
+- Epoch 3: class 8 F1=0.52, class 7 F1=0.05 (model learned 8, forgot 7)
+- Epoch 5: class 8 F1=0.00, class 7 F1=0.59 (swapped back)
+- The model oscillates between Windows variants rather than learning to distinguish them
+
+Four contributing factors:
+1. Feature selection (mutual_info_classif) selects globally informative features, not features that distinguish similar classes
+2. Star topology routes all entanglement through q0, preventing direct qubit-to-qubit correlations
+3. PauliZ-only measurements extract only one axis of information per qubit
+4. Weighted CrossEntropyLoss doesn't focus gradient signal on hard/confusable examples
+5. Classical head (Linear(20,64)->ReLU->Linear(64,12)) lacks capacity for fine-grained boundaries
+
+#### Decision 1: Ring Topology Entanglement (was Star)
+
+Replace star CNOT (all through q0) with ring topology (nearest-neighbor + wrap-around):
+  Before: for i in range(1, n_qubits): CNOT(0, i)
+  After:  for i in range(n_qubits): CNOT(i, (i+1) % n_qubits)
+
+Why: star topology means qubits 1-19 never directly interact. If features at qubit 8 and qubit 14 together distinguish windows-10-pro from windows-10, the star topology cannot learn that correlation. Ring allows nearest-neighbor correlations to propagate. Cost: +1 CNOT per layer (20 vs 19), essentially zero.
+
+Rejected alternative: all-to-all entanglement (190 CNOTs per layer, ~2-3x training time).
+
+#### Decision 2: Triple Pauli Measurements (PauliZ + PauliX + PauliY)
+
+Measure all three Pauli observables on each qubit: 60 outputs instead of 20.
+
+Why: PauliZ measures one "axis" of qubit information. Adding PauliX and PauliY extracts two additional orthogonal axes — 3x information with zero additional gate cost. The quantum state already contains this; we were not reading it.
+
+#### Decision 3: Larger Classical Head with Dropout
+
+  Before: Linear(20, 64) -> ReLU -> Linear(64, 12) = 2,124 params
+  After:  Linear(60, 128) -> ReLU -> Dropout(0.3) -> Linear(128, 12) = 8,844 params
+
+Why: with 60 inputs (from triple measurements) and 5 confusable Windows variants, the old head lacked capacity for fine decision boundaries. Dropout prevents overfitting. Cost: microseconds vs 251s quantum layer.
+
+#### Decision 4: Focal Loss (was Weighted CrossEntropyLoss)
+
+  FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t), gamma=2.0
+
+Why: weighted CE treats all correct/incorrect predictions equally within a class. Focal loss down-weights easy, well-classified examples and up-weights hard, confusable examples. Forces gradient signal toward the Windows variants the model keeps confusing. Zero compute overhead.
+
+#### Decision 5: ANOVA F-scores (was Mutual Information)
+
+  Before: SelectKBest(mutual_info_classif, k=20)
+  After:  SelectKBest(f_classif, k=20)
+
+Why: mutual_info_classif computes global dependency, favoring features that separate distinct classes (Mac vs Ubuntu vs Windows). f_classif (ANOVA F-test) computes between-class vs within-class variance, which is inherently class-aware — features that differ across ANY class pair score highly, even subtle Windows variant differences. This is the most foundational change: if the 20 features don't distinguish Windows variants, no model improvement can compensate.
+
+#### Run 4 Config Summary
+
+Setting            | Value                      | Was (Run 3) | Reason
+------------------ | -------------------------- | ----------- | ------
+entanglement       | ring topology              | star        | Enable direct qubit-to-qubit correlations
+measurements       | PauliZ + PauliX + PauliY   | PauliZ only | 3x information extraction
+classical_head     | Linear(60,128)->ReLU->Dropout(0.3)->Linear(128,12) | Linear(20,64)->ReLU->Linear(64,12) | Handle 60 inputs, more capacity
+loss               | FocalLoss(gamma=2.0)       | CrossEntropyLoss | Focus on hard examples
+feature_selection  | f_classif (ANOVA F-scores) | mutual_info_classif | Class-aware feature discrimination
+total_params       | 9,004 (160 q + 8,844 c)    | 2,284       | Mostly from wider classical head
+
+All other settings unchanged from Run 3: LR=0.005, warmup=3, grad_clip=0.75, patience=10, batch_size=512, backend=lightning.gpu.
+
+Expected additional compute per batch: ~0%. Ring adds 1 CNOT/layer, triple measurements add no gates, larger head adds microseconds. The quantum layer at 251s/batch remains the bottleneck.
+
+#### Changes NOT Made (and why)
+
+1. More variational layers (4→6-8): ~50% more training time, barren plateau risk. Feature selection is the bottleneck, not circuit depth.
+2. All-to-all CNOT: 190 CNOTs vs 20, ~2-3x batch time. Ring is sufficient.
+3. Hierarchical classification: major architectural overhaul for uncertain gain. Try simpler fixes first.
+4. More qubits (>20): exponential simulation cost. Not feasible on RTX 3090.
+5. Stratified batch sampling: engineering complexity for uncertain gain. Focal loss achieves similar effect.
+
+### Run 4 Results (Monday-WorkingHours_50th.csv, 2026-05-08 to 2026-05-14)
+
+Trained 4 completed epochs over ~6.5 days on the 50th percentile dataset (107,642 samples, imbalanced classes). All 5 Run 4 changes active: ring topology, triple Pauli measurements, larger classical head, FocalLoss, f_classif feature selection.
+
+Epoch | Loss   | Accuracy | Val F1 | LR     | Notes
+----- | ------ | -------- | ------ | ------ | -----
+1     | 0.8131 | 14.6%    | 0.0954 | 0.0005 | Warmup
+2     | 0.5504 | 15.2%    | 0.1078 | 0.0028 | Warmup ramp
+3     | 0.5350 | 15.2%    | 0.1080 | 0.0050 | Full LR reached, best F1
+4     | 0.5314 | —        | —      | —      | Stopped during validation
+
+Best result: 15.2% accuracy / 0.1080 F1 at epoch 3. **Severe regression from Run 3 (0.3510 F1).**
+
+Per-class F1 at best epoch (3): 0:0.81 1:0.00 2:0.00 3:0.00 4:0.00 5:0.31 6:0.16 7:0.00 8:0.00 9:0.05 10:0.02 11:0.10
+WARNING: classes [1, 2, 4, 7, 8] have F1=0.0 (not predicted)
+
+Observations:
+- Dramatic regression: F1 dropped 69% (0.3510 → 0.1080), accuracy dropped 65% (43.2% → 15.2%)
+- Only 3-4 of 12 classes meaningfully predicted (mac, ubuntu-server, ubuntu-web-server)
+- Quantum gradients collapsed: 0.033 → 0.008 over 4 epochs (vs 0.03-0.06 stable in Run 3)
+- Loss plateaued immediately at ~0.53 (epochs 2-4 barely moved)
+- Initial loss much lower than previous runs (0.81 vs 2.27-2.43) — FocalLoss artificially reduces loss magnitude
+- Batch time 699s (vs ~251s expected) — 2.8x slower than projected
+
+### Run 4 Post-Mortem — Root Cause Analysis (2026-05-14)
+
+Run 4 changed 5 variables simultaneously from Run 3. Investigation identified two primary causes of regression and one incorrect assumption about compute cost:
+
+#### Issue 1: f_classif Selected Redundant Features
+
+Compared the 20 features selected by f_classif (Run 4) vs mutual_info_classif (Runs 1-3) on the same dataset:
+
+**Feature overlap: only 4 of 20 features shared** (ipv4_ttl_0, ipv4_ttl_1, tcp_opt_20, tcp_opt_40).
+
+f_classif selected 14 features with nearly identical F-scores (~7856): tcp_opt_9 through tcp_opt_31. These are likely correlated TCP option bits carrying redundant information. The model effectively had 2 useful features (TTL bits) and 18 near-duplicates.
+
+mutual_info_classif selected features with varied MI scores (0.28-0.68), including tcp_doff bits and a wider spread of tcp_opt bits (32-45), providing genuinely diverse signal across the TCP/IP stack.
+
+The f_classif (ANOVA F-test) assumption was wrong: while F-scores are theoretically class-aware, in practice the binary nPrint features caused many TCP option bits to have degenerate F-scores because the between-class/within-class variance ratio is identical for correlated binary columns. mutual_info_classif handles correlated binary features better because it measures non-linear dependency.
+
+#### Issue 2: Focal Loss Suppressed Early Learning
+
+FocalLoss with gamma=2.0 down-weights all examples by (1-p_t)^2. At random initialization (p_t ≈ 1/12 ≈ 0.083), the focal weight is 0.84 — modest suppression. But the combined effect with class weights created a gradient-starved regime:
+
+- Initial loss: 0.81 (vs 2.27-2.43 in Runs 1-3 with CrossEntropyLoss)
+- Quantum gradient norms decayed from 0.033 to 0.008 in 4 epochs
+- The circuit entered a barren plateau: gradients too small to escape the initial random parameter region
+- CrossEntropyLoss provides full gradient signal, letting the quantum circuit learn broad class separations before fine-tuning. FocalLoss assumes the model already has a basic competence to build on — it cannot bootstrap from scratch.
+
+#### Issue 3: Triple Pauli Measurements Cost 3x (Not Zero)
+
+The pre-Run 4 analysis stated "zero additional gate cost" for triple Pauli measurements. This was true for gates but missed the adjoint differentiation cost:
+
+- Each qml.expval() requires a separate backward pass through the circuit during adjoint differentiation
+- 60 measurements (Z+X+Y) vs 20 (Z only) = 3x more adjoint passes
+- Actual batch time: 699s vs ~251s expected = 2.8x slowdown
+- This does not affect accuracy, but nearly triples training time per epoch
+
+#### Decision: Revert Feature Selection and Loss, Keep Architecture (Run 5)
+
+Reverted to mutual_info_classif and CrossEntropyLoss. Kept all architecture improvements: ring topology, data re-uploading, triple Pauli measurements (60 outputs), larger classical head (Linear(60,128)->ReLU->Dropout(0.3)->Linear(128,12)).
+
+Rationale: the architecture changes (ring, triple Pauli, larger head) are theoretically sound and were not the cause of regression. The regression came from the feature and loss changes that starved the model of gradient signal. By keeping the architecture and fixing the inputs/optimizer, Run 5 tests whether ring topology + triple Pauli + larger head can surpass Run 3's 0.3510 F1.
+
+Setting            | Value                      | Was (Run 4)  | Reason
+------------------ | -------------------------- | ------------ | ------
+feature_selection  | mutual_info_classif        | f_classif    | Reverted: f_classif selected redundant features
+loss               | CrossEntropyLoss (weighted) | FocalLoss    | Reverted: focal loss suppressed quantum gradients
+entanglement       | ring topology              | ring         | Kept
+measurements       | PauliZ + PauliX + PauliY   | same         | Kept (3x info, but 3x adjoint cost accepted)
+classical_head     | Linear(60,128)->ReLU->Dropout(0.3)->Linear(128,12) | same | Kept
+total_params       | 9,516 (160 q + 9,356 c)    | same         | Unchanged
+
+### Run 5 Results (Monday-WorkingHours_50th.csv, 2026-05-14 to present)
+
+Training in progress on the 50th percentile dataset (107,642 samples, imbalanced classes). Architecture from Run 4 kept (ring topology, triple Pauli, larger classical head). Reverted to mutual_info_classif + CrossEntropyLoss.
+
+Epoch | Loss   | Accuracy | Val F1 | LR     | Notes
+----- | ------ | -------- | ------ | ------ | -----
+1     | 2.3363 | 32.6%    | 0.2285 | 0.0005 | Warmup
+2     | 1.6942 | 37.0%    | 0.2811 | 0.00275 | Warmup ramp
+3     | 1.5875 | 38.4%    | 0.3053 | 0.005  | Full LR reached
+4     | 1.5684 | 39.3%    | 0.3231 | 0.005  | Best F1
+5     | ~1.560 | —        | —      | 0.005  | Stopped at batch 120/169 (71%)
+
+Best result so far: 39.3% accuracy / 0.3231 F1 at epoch 4.
+
+Per-class F1 at best epoch (4): 0:0.86 1:0.25 2:0.38 3:0.35 4:0.35 5:0.23 6:0.19 7:0.08 8:0.52 9:0.03 10:0.26 11:0.01
+
+Observations:
+- Steady improvement across all 4 epochs — no collapses or instability
+- Triple Pauli measurements confirmed working: class 8 (windows-10-pro) at 0.52 F1 vs 0.04 in Run 3 — the additional PauliX/Y info helps distinguish Windows variants
+- Classes 9 (windows-7-pro, 0.03) and 11 (windows-vista, 0.01) still near-zero F1 — class confusion persists for rare Windows variants
+- Class 7 (windows-10, 0.08) regressed vs Run 3 (0.59) as class 8 improved — the Windows class tradeoff pattern continues
+- Loss trajectory tracking Run 1/3 closely — architecture changes are neutral on convergence speed
+- Each epoch takes ~41 hours (batch time ~698s due to 60 adjoint passes for triple Pauli)
+- Quantum gradient norms (0.05-0.09) healthier than Run 4 (0.008) — confirming CE provides adequate gradient signal
+- FOCAL_LOSS_GAMMA=2.0 defined in defaults.py but not used — CrossEntropyLoss is active
+
+Key finding: Run 4's regression was primarily caused by f_classif selecting redundant features (14/20 with near-identical F-scores), not solely by FocalLoss. With mutual_info_classif providing diverse features and the model now having basic competence (F1>0.32), FocalLoss can be re-introduced to address the remaining class confusion problem — the model has the gradient foundation that Run 4 lacked.
+
+### After Run 5 Analysis — Re-introducing Focal Loss (2026-05-22)
+
+Run 5 confirmed that the architecture improvements (ring topology, triple Pauli, larger head) work well with mutual_info_classif features. The remaining problem is class confusion: windows-7-pro (0.03) and windows-vista (0.01) have near-zero F1, and windows-10 (0.08) trades off with windows-10-pro (0.52).
+
+FocalLoss was incorrectly blamed for Run 4's failure. The post-mortem showed two simultaneous failures: f_classif selected 14 redundant features AND focal loss suppressed gradients. With good features now confirmed, FocalLoss can target the class confusion problem it was designed to solve.
+
+#### Decision: Implement FocalLoss (CrossEntropyLoss → FocalLoss)
+
+FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t), gamma=2.0
+
+Combined with existing inverse-frequency class weights. The model now has basic competence (F1>0.32), so focal modulation will focus gradients on the hard Windows variant examples rather than starving them as in Run 4.
+
+Setting            | Value                      | Was (Run 5)  | Reason
+------------------ | -------------------------- | ------------ | ------
+loss               | FocalLoss(gamma=2.0, weighted) | CrossEntropyLoss (weighted) | Focus gradients on confusable Windows variants
+feature_selection  | mutual_info_classif        | same         | Kept — confirmed working
+all other settings | unchanged                  | same         | Kept

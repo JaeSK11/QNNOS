@@ -1,0 +1,22 @@
+services:
+  quantum-train:
+    build: .
+    # Auto-recover if the container is killed by a Docker daemon restart
+    # (e.g. an automatic package/snap update) or a non-zero exit. Combined with
+    # --resume below, the run continues from the last completed epoch rather
+    # than restarting from scratch. "unless-stopped" won't restart after an
+    # explicit `docker compose stop`.
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/workspace/data
+      - ./models:/workspace/models
+    command: python scripts/train.py data/Monday-WorkingHours_balanced_11th.csv model_out --backend lightning.gpu --resume

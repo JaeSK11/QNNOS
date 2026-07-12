@@ -1,0 +1,29 @@
+# Virtual environments
+QNNenv/
+venv/
+.venv/
+
+# Datasets — nPrint CSVs are large (up to 13 GB) and contain raw source IPs.
+# See README "Dataset" section for how to generate your own.
+data/*.csv
+!data/labels.csv
+
+# Training run artifacts (the published checkpoint model_out.pt/.json is kept)
+models/training_progress*.json
+models/training_log.txt
+models/*.tmp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Local tool settings
+.claude/settings.local.json
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,43 @@
+{
+  "n_qubits": 20,
+  "n_layers": 4,
+  "n_features": 20,
+  "n_classes": 12,
+  "feature_indices": [
+    48,
+    49,
+    399,
+    400,
+    402,
+    483,
+    484,
+    486,
+    497,
+    499,
+    500,
+    502,
+    503,
+    504,
+    505,
+    506,
+    507,
+    508,
+    530,
+    531
+  ],
+  "label_classes": [
+    "mac_mac-os-x",
+    "ubuntu-14.4-32b",
+    "ubuntu-14.4-64b",
+    "ubuntu-16.4-32b",
+    "ubuntu-16.4-64b",
+    "ubuntu-ubuntu-server",
+    "ubuntu-web-server",
+    "windows-10",
+    "windows-10-pro",
+    "windows-7-pro",
+    "windows-8.1",
+    "windows-vista"
+  ],
+  "backend": "lightning.gpu"
+}

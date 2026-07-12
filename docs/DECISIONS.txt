@@ -1,0 +1,267 @@
+================================================================================
+QuantumNeuralNetworkOS -- Decision Log
+================================================================================
+
+Date: 2026-05-07
+Context: Model plateaued at epoch 26 with val_F1=0.3510, accuracy=43%.
+         Classes 8 (windows-10-pro), 9 (windows-7-pro), 11 (windows-vista)
+         stuck at near-zero F1 (0.04, 0.05, 0.01 respectively).
+
+--------------------------------------------------------------------------------
+PROBLEM DIAGNOSIS
+--------------------------------------------------------------------------------
+
+Root cause: CLASS CONFUSION, not class imbalance.
+
+Classes 8, 9, 11 are NOT small classes:
+  - Class 8 (windows-10-pro):  19,948 training samples (23.2%)  -- 2nd largest
+  - Class 9 (windows-7-pro):    4,314 training samples (5.0%)
+  - Class 11 (windows-vista):   3,127 training samples (3.6%)
+  - Combined: 31.74% of all training data
+
+These are all Windows variants with near-identical network fingerprints. The
+model was collapsing them into a single decision region -- when it learned to
+classify one Windows variant, it forgot another (epochs 3-5 showed class 7 and
+class 8 trading off F1 scores).
+
+Evidence:
+  - Epoch 3: class 8 F1=0.52, class 7 F1=0.05 (swapped)
+  - Epoch 5: class 8 F1=0.00, class 7 F1=0.59 (swapped back)
+  - Epoch 26: class 7 F1=0.59, class 8 F1=0.04 (settled on class 7)
+
+Contributing factors:
+  1. Feature selection discarding class-discriminative features
+  2. Quantum circuit bottleneck limiting information extraction
+  3. Undersized classical head lacking capacity for fine boundaries
+  4. Loss function not penalizing hard/confusable examples enough
+
+--------------------------------------------------------------------------------
+DECISION 1: Ring Topology Entanglement (was Star)
+--------------------------------------------------------------------------------
+
+File changed: circuits/model.py
+
+Before:
+  Star topology -- all CNOTs route through qubit 0.
+  Qubits 1-19 never directly interact with each other.
+
+After:
+  Ring topology -- each qubit entangles with its neighbor, wrap-around.
+  CNOT(i, (i+1) % n_qubits) for all i.
+
+Why:
+  If features at qubit 8 and qubit 14 together distinguish windows-10-pro from
+  windows-10, the star topology cannot learn that correlation -- it must route
+  everything through qubit 0 as a bottleneck. Ring topology allows nearest-
+  neighbor correlations to propagate and costs only 1 extra CNOT per layer
+  (20 vs 19). Essentially zero additional compute.
+
+What we considered but rejected:
+  - All-to-all entanglement: 190 CNOTs per layer vs 20. Would roughly 2-3x
+    training time per batch (currently 251s/batch, would become ~500-750s).
+    Not worth the compute cost when the input features may not even contain
+    the right discriminative information yet.
+
+--------------------------------------------------------------------------------
+DECISION 2: Triple Pauli Measurements (PauliZ + PauliX + PauliY)
+--------------------------------------------------------------------------------
+
+File changed: circuits/model.py
+
+Before:
+  20 PauliZ measurements only (one per qubit).
+
+After:
+  60 measurements total: PauliZ, PauliX, PauliY on each of 20 qubits.
+
+Why:
+  PauliZ measures one "axis" of information per qubit. Adding PauliX and PauliY
+  extracts two additional orthogonal axes -- 3x the information from the same
+  circuit with zero additional gate cost. No extra qubits, no extra depth, no
+  extra simulation time. The quantum state already contains this information;
+  we were simply not reading it.
+
+  This directly addresses the information bottleneck: the circuit compresses
+  2^20 (~1M) dimensional Hilbert space down to measurements. Going from 20 to
+  60 outputs gives the classical head 3x more signal to work with.
+
+Impact on model:
+  - Quantum output dimension: 20 -> 60
+  - Classical head input: 20 -> 60
+  - Quantum parameters unchanged: 160
+  - No change to training time per batch
+
+--------------------------------------------------------------------------------
+DECISION 3: Larger Classical Head with Dropout
+--------------------------------------------------------------------------------
+
+File changed: training/hybrid_model.py
+
+Before:
+  Linear(20, 64) -> ReLU -> Linear(64, 12)
+  Parameters: 2,124
+
+After:
+  Linear(60, 128) -> ReLU -> Dropout(0.3) -> Linear(128, 12)
+  Parameters: 8,844
+
+Why:
+  The old head had to separate 12 classes (including 5 confusable Windows
+  variants) from only 20 coarse quantum features through a 64-neuron hidden
+  layer. This is insufficient capacity for fine-grained decision boundaries.
+
+  With 60 inputs (from triple measurements) and 128 hidden neurons, the head
+  has ~4x more capacity to learn the subtle differences between Windows
+  variants. Dropout (0.3) prevents overfitting to the larger head.
+
+  The quantum layer at 251s/batch is the compute bottleneck. The classical
+  head adds microseconds. This change is effectively free.
+
+What we considered but rejected:
+  - Even larger heads (256+ neurons): Diminishing returns. The bottleneck is
+    still the quantum feature quality, not classical capacity.
+  - Batch normalization: Adds complexity; dropout alone should suffice given
+    the binary nature of the input features.
+
+--------------------------------------------------------------------------------
+DECISION 4: Focal Loss (was Weighted CrossEntropyLoss)
+--------------------------------------------------------------------------------
+
+File changed: training/trainer.py, config/defaults.py
+
+Before:
+  nn.CrossEntropyLoss(weight=class_weights)
+  Inverse-frequency weighting: weight[i] = (1/count[i]) / sum(1/count) * 12
+
+After:
+  FocalLoss(weight=class_weights, gamma=2.0)
+  FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+Why:
+  Weighted CE treats all correct/incorrect predictions equally within a class.
+  The model was getting high reward for correctly classifying easy Mac/Ubuntu
+  samples (class 0: F1=0.86) while barely being penalized for misclassifying
+  confusable Windows variants.
+
+  Focal loss with gamma=2.0 down-weights easy, well-classified examples
+  (where p_t is high) and up-weights hard, confusable examples (where p_t is
+  low). This forces the model to focus gradient signal on the Windows variants
+  it keeps confusing, rather than coasting on easy classifications.
+
+  Combined with the existing inverse-frequency class weights, this addresses
+  both class imbalance (via alpha weights) and class confusion (via focal
+  modulation).
+
+  Zero computational overhead -- same forward/backward pass cost.
+
+Why gamma=2.0:
+  This is the standard value from the original focal loss paper (Lin et al.,
+  2017). It provides strong down-weighting of easy examples without being so
+  aggressive that it destabilizes training. Can be tuned later if needed.
+
+--------------------------------------------------------------------------------
+DECISION 5: ANOVA F-scores (was Mutual Information)
+--------------------------------------------------------------------------------
+
+File changed: data/pipeline.py
+
+Before:
+  SelectKBest(mutual_info_classif, k=20)
+
+After:
+  SelectKBest(f_classif, k=20)
+
+Why:
+  mutual_info_classif computes a global measure of dependency between each
+  feature and the label. It tends to select features that separate the most
+  distinct classes (Mac vs Ubuntu vs Windows) but not features that distinguish
+  similar classes within a group (windows-10 vs windows-10-pro).
+
+  f_classif (ANOVA F-test) computes the ratio of between-class variance to
+  within-class variance for each feature. This is inherently class-aware:
+  features that have different distributions across ANY pair of classes will
+  score highly, even if the difference is subtle (e.g., a TCP option that
+  differs between Windows 7 and Windows 10 but is the same for all Ubuntu
+  variants).
+
+  This is the most impactful change. If the 20 selected features don't contain
+  information that distinguishes Windows variants, no amount of circuit or
+  model improvement can compensate. Garbage in, garbage out.
+
+  No computational overhead -- feature selection runs once before training.
+
+What we considered but rejected:
+  - Increasing k from 20 to 40-50: Would require more qubits, which
+    exponentially increases quantum simulation cost. Not feasible on current
+    hardware without a circuit redesign.
+  - Per-class feature selection: More complex to implement and would require
+    different features per classification stage. Saved for future work if
+    ANOVA alone doesn't resolve the confusion.
+
+--------------------------------------------------------------------------------
+CHANGES NOT MADE (and why)
+--------------------------------------------------------------------------------
+
+1. More variational layers (4 -> 6-8):
+   Would increase training time ~50% per epoch. Risk of barren plateaus
+   (vanishing gradients in deep quantum circuits). Diminishing returns given
+   the current feature selection is the primary bottleneck.
+
+2. All-to-all CNOT entanglement:
+   190 CNOTs per layer vs 20. Would roughly 2-3x batch time. The ring
+   topology provides a good balance of expressivity and efficiency.
+
+3. Hierarchical classification (OS family -> variant):
+   Significant architectural overhaul. Requires two models or a two-stage
+   circuit, new training logic, and pipeline changes. Saved for future work
+   if the current changes don't resolve class confusion.
+
+4. Increasing qubit count beyond 20:
+   Exponential simulation cost. 20 qubits on lightning.gpu is already near
+   the practical limit for reasonable training times on RTX 3090.
+
+5. Stratified batch sampling:
+   Would ensure confusable class pairs co-occur in each batch. Added
+   engineering complexity for uncertain gain. Focal loss achieves a similar
+   effect by focusing gradients on hard examples regardless of batch
+   composition.
+
+--------------------------------------------------------------------------------
+EXPECTED IMPACT
+--------------------------------------------------------------------------------
+
+Total additional compute per batch: ~0%
+  - Ring topology: +1 CNOT/layer (negligible)
+  - Triple measurements: no extra gates
+  - Larger classical head: microseconds vs 251s quantum layer
+  - Focal loss: same forward/backward cost
+  - ANOVA feature selection: one-time cost before training
+
+Model parameters: 2,284 -> 9,004
+  - Quantum: 160 (unchanged)
+  - Classical: 2,124 -> 8,844
+
+Requires full retrain from scratch (new features, new architecture).
+Current run has plateaued and should be stopped.
+
+--------------------------------------------------------------------------------
+PREVIOUS MODEL PERFORMANCE (baseline for comparison)
+--------------------------------------------------------------------------------
+
+Best results after 26 epochs (~2 weeks training):
+  - Val F1: 0.3510 (epoch 26)
+  - Accuracy: 43.18% (epoch 24)
+  - Loss: 1.5277 (epoch 25)
+  - Per-class F1 (epoch 26):
+      0 (mac):           0.86
+      1 (ubuntu-14-32):  0.30
+      2 (ubuntu-14-64):  0.40
+      3 (ubuntu-16-32):  0.31
+      4 (ubuntu-16-64):  0.30
+      5 (ubuntu-server): 0.26
+      6 (ubuntu-web):    0.20
+      7 (windows-10):    0.59
+      8 (windows-10-pro):0.04  <-- target
+      9 (windows-7-pro): 0.05  <-- target
+     10 (windows-8.1):   0.27
+     11 (windows-vista):  0.01  <-- target

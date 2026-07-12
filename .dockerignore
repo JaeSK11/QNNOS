@@ -1,0 +1,9 @@
+QNNenv/
+models/
+data/*.csv
+docs/
+.git/
+.claude/
+.pytest_cache/
+__pycache__/
+*.pyc
