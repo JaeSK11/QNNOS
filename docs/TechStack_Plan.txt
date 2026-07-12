@@ -24,10 +24,10 @@ All data processing and transformation is done classically. The quantum circuit 
 ### Quantum Compute (model)
 - Receives clean tensor of shape (batch_size, 20)
 - RY AngleEmbedding into 20-qubit circuit (input * pi)
-- Ring topology CNOT entanglement (nearest-neighbor + wrap-around) after encoding
-- 4 variational layers with data re-uploading (AngleEmbedding + per-qubit RY + RZ rotations + ring CNOT)
+- Ring topology entangler (nearest-neighbor + wrap-around) after encoding: fixed CNOT (default) or trainable CRZ (--entangler crz)
+- 4 variational layers with data re-uploading (AngleEmbedding + per-qubit RY + RZ rotations + ring entangler)
 - PauliZ + PauliX + PauliY expectation value measurements on all 20 qubits (60 outputs)
-- Classical head maps 60 expectation values to class logits via Linear(60,128)->ReLU->Dropout(0.3)->Linear(128,n_classes)
+- Classical head maps quantum expvals and/or raw features to class logits: [BatchNorm1d?] -> Linear(head_in,128) -> ReLU -> Dropout(p) -> Linear(128,n_classes); head_in is 60 (quantum), 80 (+--skip), or 20 (--no-quantum --skip classical baseline)
 - Training via Adam + FocalLoss (class-weighted, gamma=2.0) + adjoint differentiation backprop
 
 The quantum side has no knowledge of nPrint, CSV formats, or feature engineering. It takes a preprocessed feature tensor and learns to classify.
@@ -196,25 +196,34 @@ AngleEmbedding   | qml.AngleEmbedding   | 20     | 20 (one RY rotation per qubit
 
 Ring topology CNOT: qubit i→(i+1) % n_qubits for all i. Creates nearest-neighbor entanglement with wrap-around, allowing correlations between adjacent features to propagate through the ring.
 
+Note: on the binary RY encoding, the post-encoding state is a computational
+basis state, so the first (post-encoding) ring is a classical XOR permutation of
+bits -- it creates NO entanglement on its own. Genuine entanglement only appears
+once the variational layers' RY/RZ rotations put qubits into superposition. The
+"entanglement" label on the first ring is aspirational structure, not a quantum
+effect at that point in the circuit.
+
 Previously:
 - Run 1-2: linear CNOT chain (q0→q1→q2→...→q19), nearest-neighbor only.
 - Run 3: star topology from q0 (q0→q1, q0→q2, ..., q0→q19). Enabled long-range correlations via q0 hub but prevented direct qubit-to-qubit interaction (qubits 1-19 never directly entangled with each other).
 - Run 4: ring topology. Changed because star topology created a bottleneck -- if features at qubit 8 and qubit 14 together distinguish windows-10-pro from windows-10, star topology cannot learn that correlation directly. Ring allows neighbor correlations to propagate while costing only 1 extra CNOT per layer vs star (20 vs 19).
+- Run 6: configurable entangler. ENTANGLER / --entangler selects "cnot" (fixed ring, default) or "crz" (trainable controlled-RZ ring). CRZ(theta) has a learned angle per pair -- CRZ(0)=identity, larger angles couple more strongly -- so the model learns how much to entangle each neighboring pair instead of the fixed all-or-nothing CNOT. Adds one param/qubit/layer; "crz" checkpoints are not weight-compatible with "cnot".
 
 ### Variational Ansatz
 
 Custom ansatz with data re-uploading (not BasicEntanglerLayers). Per layer:
 1. Data re-upload: AngleEmbedding(inputs * pi) re-encodes the raw features (enables universal approximation)
 2. RY(theta) and RZ(phi) on each qubit (2 parameters per qubit per layer)
-3. Star topology CNOT from q0 for entanglement
+3. Ring entangler for entanglement: fixed CNOT (default) or trainable CRZ (--entangler crz, +1 param/qubit/layer)
 
-Previously (Run 1-2): no data re-uploading, linear CNOT chain. Changed in Run 3 — re-uploading breaks the expressivity ceiling that caused both runs to plateau.
+Previously (Run 1-2): no data re-uploading, linear CNOT chain. Changed in Run 3 — re-uploading breaks the expressivity ceiling that caused both runs to plateau. (Earlier drafts of this doc described a "star topology CNOT from q0" here; the code has used the ring entangler since Run 4.)
 
-Ansatz           | Params per layer | Total params (4 layers, 20 qubits) | Notes
----------------- | ---------------- | ----------------------------------- | -----
-Custom RY+RZ     | 40               | 160                                 | More expressive than BasicEntanglerLayers (2 rotations vs 1)
+Ansatz              | Params per layer | Total params (4 layers, 20 qubits) | Notes
+------------------- | ---------------- | ----------------------------------- | -----
+RY+RZ + CNOT ring   | 40               | 160                                 | Default; fixed entangler, 2 trainable rotations/qubit
+RY+RZ + CRZ ring    | 60               | 240                                 | Run 6 --entangler crz; adds a learned coupling angle/qubit/layer
 
-This is more expressive than the BasicEntanglerLayers originally planned. RY handles amplitude control, RZ handles phase control, and the CNOT chains entangle qubits — giving the ansatz access to a larger portion of the Hilbert space.
+This is more expressive than the BasicEntanglerLayers originally planned. RY handles amplitude control, RZ handles phase control, and the entangling ring correlates qubits — giving the ansatz access to a larger portion of the Hilbert space. With "crz" the coupling strength of each ring bond is itself trainable.
 
 ### Measurement
 
@@ -232,7 +241,9 @@ diff_method is backend-dependent:
 
 Single file containing the create_circuit() factory function. Returns a QNode with torch interface and a weight_shapes dict for TorchLayer integration.
 
-weight_shapes = {"weights": (n_layers, n_qubits, 2)}  # (4, 20, 2) = 160 params
+weight_shapes = {"weights": (n_layers, n_qubits, 2)}  # (4, 20, 2) = 160 params (cnot)
+# With --entangler crz: (n_layers, n_qubits, 3) = (4, 20, 3) = 240 params
+# create_circuit(n_qubits, n_layers, backend, entangler) selects the entangler.
 
 ---
 
@@ -273,21 +284,31 @@ Reference files:
 
 ### Hybrid Model (HybridQuantumNet)
 
-Input (20) -> TorchLayer(QNode) -> [60 expectation values (Z+X+Y)] -> Linear(60, 128) -> ReLU -> Dropout(0.3) -> Linear(128, n_classes) -> logits
+Input (20) -> [TorchLayer(QNode) -> 60 expvals] and/or [raw 20 features] -> [BatchNorm1d?] -> Linear(head_in, 128) -> ReLU -> Dropout(p) -> Linear(128, n_classes) -> logits
 
 qml.qnn.TorchLayer wraps the QNode as a standard nn.Module, so PyTorch handles all gradient computation automatically via adjoint differentiation on the quantum side and standard autograd on the classical side.
 
 Previously (Run 1-3): 20 PauliZ outputs -> Linear(20, 64) -> ReLU -> Linear(64, 12). Changed in Run 4 to handle 60 measurement outputs and provide more capacity for fine-grained class discrimination. Dropout(0.3) prevents overfitting with the larger head.
 
+Run 6 made the head composable (all flags persisted in the model config so test.py / --resume rebuild the same head; defaults reproduce Run 4/5 behavior):
+- --batchnorm: BatchNorm1d on the head inputs. The 60 expvals span very different scales (PauliZ ~ +/-1 on near-basis states, PauliX/Y ~ 0), which conditions the first Linear poorly; per-feature BatchNorm across the batch fixes that (LayerNorm, per-sample, would not).
+- --skip: concat the raw 20 features with the expvals (head_in 60 -> 80). Residual path so the head can use data the circuit maps poorly; provably >= a classical MLP on the raw features, and a built-in diagnostic (skip-column vs quantum-column weight norms) for how much the circuit is used.
+- --dropout P: configurable (default 0.3). Lower to ~0.1 when the model is underfitting (train/val F1 track closely).
+- --no-quantum (requires --skip): drops the circuit entirely -> classical baseline (raw 20 -> head). Isolates the circuit's marginal contribution; runs in seconds on CPU.
+
 ### Parameter Count
+
+Default head (Run 4/5 defaults, cnot entangler):
 
 Component        | Parameters
 ---------------- | ----------
-Quantum layer    | 160 (4 layers x 20 qubits x 2 rotations)
+Quantum layer    | 160 (4 layers x 20 qubits x 2 rotations; 240 with --entangler crz)
 Linear(60, 128)  | 7,808 (60*128 + 128 bias)
 Dropout(0.3)     | 0
 Linear(128, 12)  | 1,548 (128*12 + 12 bias)
 **Total**        | **9,516**
+
+Variant head input dims: 60 (quantum only), 80 (--skip), 20 (--no-quantum --skip). --batchnorm adds 2*head_in affine params. Changing head_in changes the Linear shapes, so variant checkpoints are not weight-compatible with the default -- use distinct model names when A/B-ing.
 
 ### Training Config
 

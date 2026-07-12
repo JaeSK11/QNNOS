@@ -175,6 +175,11 @@ def load_checkpoint(
         n_qubits=config["n_qubits"],
         n_layers=config["n_layers"],
         backend=backend,
+        entangler=config.get("entangler", "cnot"),
+        use_quantum=config.get("use_quantum", True),
+        use_skip=config.get("use_skip", False),
+        use_batchnorm=config.get("use_batchnorm", False),
+        dropout=config.get("dropout", 0.3),
     )
     weights_path = os.path.join(save_dir, f"{name}.pt")
     model.load_state_dict(torch.load(weights_path, weights_only=True))
@@ -280,7 +285,10 @@ def train_model(
             # Measure gradient norms before clipping (read-only)
             log_grads = (n_batches + 1) % LOG_GRAD_INTERVAL == 0
             if log_grads:
-                q_params = [p for p in model.quantum_layer.parameters() if p.grad is not None]
+                q_params = (
+                    [p for p in model.quantum_layer.parameters() if p.grad is not None]
+                    if model.quantum_layer is not None else []
+                )
                 c_params = [p for p in model.classical_head.parameters() if p.grad is not None]
                 q_grad_norm = torch.sqrt(sum(p.grad.norm() ** 2 for p in q_params)).item() if q_params else 0.0
                 c_grad_norm = torch.sqrt(sum(p.grad.norm() ** 2 for p in c_params)).item() if c_params else 0.0

@@ -77,6 +77,9 @@ def test_prepare_data(sample_csv):
     assert data["X_train"].dtype == torch.float32
     assert data["y_train"].dtype == torch.long
     assert data["n_classes"] == 3
+    # Mutual-information score per selected feature, aligned with feature_indices.
+    assert len(data["feature_scores"]) == N_FEATURES
+    assert all(isinstance(s, float) for s in data["feature_scores"])
 
 
 def test_create_dataloaders(sample_csv):

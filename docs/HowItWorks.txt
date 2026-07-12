@@ -207,6 +207,30 @@ This is analogous to XGBoost's tree depth: a depth-10 tree can combine up to 10
 features in a single decision path. Entanglement lets the quantum circuit combine
 ALL 20 features simultaneously in a single quantum state.
 
+Trainable entanglers (optional; Run 6)
+
+By default the entangling gate is a fixed CNOT with no trainable parameters. As
+of Run 6 the circuit also supports a trainable controlled-RZ ring, selected with
+ENTANGLER="crz" in config/defaults.py or --entangler crz on the CLI. Each CNOT is
+replaced by CRZ(theta) with a learned angle per neighboring pair:
+
+  - CRZ(0) is the identity -- no coupling at all
+  - larger |theta| entangles the pair more strongly
+
+So instead of a fixed, all-or-nothing ring, the optimizer LEARNS how much to
+couple each pair: entangle the feature pairs that jointly matter (e.g. qubits 8
+and 14 for windows-10 vs windows-10-pro) and leave uncorrelated ones decoupled.
+This costs one extra parameter per qubit per layer -- the weight tensor grows
+from (4, 20, 2) = 160 to (4, 20, 3) = 240 params. A "crz" checkpoint is NOT
+weight-compatible with a "cnot" one, so switching needs a fresh run under a new
+model name.
+
+Why is "cnot" still the default? It is cheaper, and on the near-classical states
+produced by binary RY encoding (recall from Stage 2 that the first ring does no
+entangling work on basis states) the fixed ring is already enough structure. "crz" is the thing
+to try once the encoding produces genuinely entangled states -- that is where a
+learnable coupling strength has something to bite on.
+
 
 STAGE 3: Variational layers with data re-uploading (where learning happens)
 
@@ -281,7 +305,9 @@ Then Layer 3 and Layer 4, each with their own 40 angles and ring CNOTs.
 
 Total trainable angles: 4 layers x 20 qubits x 2 rotations = 160 parameters.
 Stored as a tensor of shape (4, 20, 2). The data re-uploading adds 20 RY gates
-per layer but zero trainable parameters (they are data-driven).
+per layer but zero trainable parameters (they are data-driven). (With the
+trainable "crz" entangler this becomes (4, 20, 3) = 240 parameters -- the extra
+angle per qubit per layer drives the controlled-RZ coupling described above.)
 
 After all 4 layers, the 20-qubit quantum state has been thoroughly mixed. Each
 qubit's state depends on:
@@ -378,7 +404,7 @@ These get converted to probabilities via softmax:
 Before training, the prediction is essentially random -- Windows-8.1 at 8.5%
 happens to be the highest, but the true label is Windows-10 at 6.9%.
 
-In the code, the classical head is:
+In the code, the classical head (default configuration) is:
 
   nn.Sequential(
       nn.Linear(60, 128),
@@ -386,6 +412,52 @@ In the code, the classical head is:
       nn.Dropout(0.3),
       nn.Linear(128, 12),
   )
+
+
+Configurable head variants (Run 6) and why
+
+The head is now composable via config flags, all persisted in the model config
+so test.py and --resume rebuild the exact same head. Defaults reproduce the
+original behavior above; each option targets a specific weakness.
+
+  --batchnorm  (BatchNorm1d on the 60 head inputs)
+      Why: the 60 inputs are on wildly different scales. On the near-basis
+      states this circuit produces, the 20 PauliZ values sit near +/-1 while the
+      40 PauliX/PauliY values cluster near 0 with tiny variance. A single Linear
+      layer is poorly conditioned when its inputs span such different scales.
+      BatchNorm1d normalizes each of the 60 features to zero mean / unit variance
+      ACROSS the batch, which is the right tool for per-feature scale disparity
+      (LayerNorm, which normalizes within a sample, would not fix it). Batch 512
+      in training / 64 in test is plenty for stable running statistics.
+
+  --skip  (concatenate the raw 20 features with the 60 expvals -> Linear(80,128))
+      Why: today the classifier only sees the data through the circuit, so any
+      information the circuit maps poorly is simply lost. The skip path lets the
+      head read the raw features directly, so the model provably cannot do worse
+      than a classical MLP on those features -- the quantum outputs then only
+      need to contribute what the raw features cannot. It also doubles as a
+      diagnostic: after training, compare the first Linear layer's weight norms
+      on the skip columns vs the quantum columns to see how much the circuit is
+      actually being used.
+
+  --dropout P  (default 0.3)
+      Why: at low validation F1 the model is likely UNDERfitting, and dropout
+      0.3 on top of focal loss and class weights is a lot of regularization
+      pressure. If train and val F1 track closely in the logs (no overfitting
+      gap), lowering to 0.1 lets the head fit more before you add capacity.
+
+  --no-quantum  (drop the quantum layer entirely; requires --skip)
+      Why: this is the classical baseline -- the same head on the raw 20 features
+      with no circuit at all (raw -> [BatchNorm] -> Linear(20,128) -> ... ). It
+      answers the most important question before any circuit tuning: how much is
+      the quantum circuit actually contributing over a plain classical MLP? It
+      runs in seconds on CPU. If it matches the full model's F1, the circuit is
+      not earning its keep and effort belongs in the encoding/feature selection.
+
+Head input dimension follows the flags: 60 (quantum only, default), 80 (quantum
++ skip), or 20 (classical baseline: --no-quantum --skip). Because these change
+Linear shapes, a variant checkpoint is not weight-compatible with the default;
+use a distinct model name when A/B-ing.
 
 ---
 
@@ -767,6 +839,13 @@ Why not skip the classical head and use 12 qubits (one per class)? Because
 PauliZ measurements are in [-1, +1], and the relationship between quantum
 measurements and OS classes is complex. The classical head provides the
 flexibility to map arbitrary measurement patterns to arbitrary class scores.
+
+A caveat this raises: because the head is expressive on its own, a good final F1
+does not by itself prove the quantum circuit is contributing. That is exactly
+what the Run 6 --no-quantum classical baseline and the --skip residual path (both
+described under "Configurable head variants" above) are for -- they isolate the
+head's standalone performance so the circuit's marginal contribution can be
+measured rather than assumed.
 
 ---
 

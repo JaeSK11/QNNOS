@@ -96,9 +96,13 @@ def prepare_data(
         indices = list(feature_indices)
         X_train_sel = X_train[:, indices]
         X_test_sel = X_test[:, indices]
+        # Scores come from fitting SelectKBest; unavailable when reusing indices.
+        feature_scores = None
     else:
         X_train_sel, X_test_sel, selector = select_features(X_train, X_test, y_train, k=k)
         indices = selector.get_support(indices=True).tolist()
+        # Mutual-information score for each selected feature (aligned with indices).
+        feature_scores = [float(selector.scores_[i]) for i in indices]
 
     return {
         "X_train": torch.tensor(X_train_sel, dtype=torch.float32),
@@ -108,6 +112,7 @@ def prepare_data(
         "label_encoder": le,
         "selector": selector,
         "feature_indices": indices,
+        "feature_scores": feature_scores,
         "n_classes": len(le.classes_),
     }
 

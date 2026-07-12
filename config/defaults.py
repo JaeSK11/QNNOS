@@ -3,10 +3,22 @@ N_QUBITS = 20
 N_LAYERS = 4
 N_FEATURES = 20
 
+# Per-layer entangler:
+#   "cnot" - fixed CNOT ring (no trainable parameters, 2 params/qubit/layer)
+#   "crz"  - trainable controlled-RZ ring; entanglement strength is learned
+#            (3 params/qubit/layer). Changes weight_shapes, so a "crz" model
+#            is NOT weight-compatible with a "cnot" checkpoint.
+ENTANGLER = "cnot"
+
 # Training
 BATCH_SIZE = 512
 LEARNING_RATE = 0.005
 PATIENCE = 10
+
+# Classical head
+DROPOUT = 0.3           # dropout in the classical head
+USE_SKIP = False        # concat raw input features with quantum outputs (residual path)
+USE_BATCHNORM = False   # BatchNorm1d on head inputs (normalizes per-feature scale)
 
 # LR scheduler
 LR_WARMUP_EPOCHS = 3          # linear warmup from LR/10 to LR

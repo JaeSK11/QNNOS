@@ -14,13 +14,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.defaults import (
     BATCH_SIZE,
     DEFAULT_BACKEND,
+    DROPOUT,
+    ENTANGLER,
     LEARNING_RATE,
     N_FEATURES,
     N_LAYERS,
     N_QUBITS,
     PATIENCE,
+    USE_BATCHNORM,
+    USE_SKIP,
 )
 from data.pipeline import create_dataloaders, prepare_data
+from evaluation.inspection import feature_importance_ranking, format_ranking
 from evaluation.metrics import full_report
 from training.hybrid_model import HybridQuantumNet
 from training.trainer import load_resume_checkpoint, train_model
@@ -36,6 +41,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-qubits", type=int, default=N_QUBITS)
     parser.add_argument("--n-layers", type=int, default=N_LAYERS)
     parser.add_argument("--n-features", type=int, default=N_FEATURES)
+    parser.add_argument(
+        "--entangler",
+        choices=["cnot", "crz"],
+        default=ENTANGLER,
+        help="Per-layer entangler: 'cnot' (fixed ring) or 'crz' (trainable). "
+        "A 'crz' model is not weight-compatible with a 'cnot' checkpoint.",
+    )
+    parser.add_argument("--dropout", type=float, default=DROPOUT, help="Head dropout probability")
+    parser.add_argument(
+        "--skip", action=argparse.BooleanOptionalAction, default=USE_SKIP,
+        help="Concat raw features with quantum outputs (residual path).",
+    )
+    parser.add_argument(
+        "--batchnorm", action=argparse.BooleanOptionalAction, default=USE_BATCHNORM,
+        help="BatchNorm1d on head inputs (normalizes per-feature scale).",
+    )
+    parser.add_argument(
+        "--quantum", action=argparse.BooleanOptionalAction, default=True,
+        help="Use the quantum circuit. --no-quantum with --skip = classical baseline.",
+    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
     parser.add_argument("--epochs", type=int, default=50)
@@ -81,6 +106,9 @@ def main() -> None:
 
     args = parse_args()
 
+    if not args.quantum and not args.skip:
+        raise SystemExit("--no-quantum requires --skip (otherwise the model has no inputs).")
+
     saved_config = None
     feature_indices = None
     if args.resume:
@@ -89,6 +117,11 @@ def main() -> None:
         args.n_qubits = saved_config["n_qubits"]
         args.n_layers = saved_config["n_layers"]
         args.n_features = saved_config["n_features"]
+        args.entangler = saved_config.get("entangler", "cnot")
+        args.quantum = saved_config.get("use_quantum", True)
+        args.skip = saved_config.get("use_skip", False)
+        args.batchnorm = saved_config.get("use_batchnorm", False)
+        args.dropout = saved_config.get("dropout", 0.3)
         feature_indices = saved_config["feature_indices"]
         print("Resuming: reusing saved feature columns, label mapping, and architecture.", flush=True)
 
@@ -102,6 +135,15 @@ def main() -> None:
     print(f"Training samples: {len(data['X_train'])}", flush=True)
     print(f"Test samples: {len(data['X_test'])}", flush=True)
     print(f"Features selected: {data['feature_indices']}", flush=True)
+
+    # Feature-importance ranking (mutual information). On resume the scores were
+    # not recomputed (indices were reused), so fall back to the saved config's.
+    feature_scores = data.get("feature_scores")
+    if feature_scores is None and saved_config is not None:
+        feature_scores = saved_config.get("feature_scores")
+    ranking = feature_importance_ranking(data["feature_indices"], feature_scores)
+    print("Feature importance (mutual information, top 10):", flush=True)
+    print(format_ranking(ranking, top=10), flush=True)
 
     # Class distribution in training set
     class_counts = torch.bincount(data["y_train"], minlength=data["n_classes"])
@@ -117,16 +159,26 @@ def main() -> None:
     )
 
     print(f"Batches per epoch: {len(train_loader)} train, {len(test_loader)} test", flush=True)
-    print(f"Building model: {args.n_qubits} qubits, {args.n_layers} layers, backend={args.backend}", flush=True)
+    print(f"Building model: {args.n_qubits} qubits, {args.n_layers} layers, "
+          f"entangler={args.entangler}, quantum={args.quantum}, skip={args.skip}, "
+          f"batchnorm={args.batchnorm}, dropout={args.dropout}, backend={args.backend}", flush=True)
     t1 = time.time()
     model = HybridQuantumNet(
         n_classes=data["n_classes"],
         n_qubits=args.n_qubits,
         n_layers=args.n_layers,
         backend=args.backend,
+        entangler=args.entangler,
+        use_quantum=args.quantum,
+        use_skip=args.skip,
+        use_batchnorm=args.batchnorm,
+        dropout=args.dropout,
     )
     build_elapsed = time.time() - t1
-    q_params = sum(p.numel() for p in model.quantum_layer.parameters())
+    q_params = (
+        sum(p.numel() for p in model.quantum_layer.parameters())
+        if model.quantum_layer is not None else 0
+    )
     c_params = sum(p.numel() for p in model.classical_head.parameters())
     print(f"Model built: {build_elapsed:.1f}s", flush=True)
     print(f"Parameters: {q_params} quantum + {c_params} classical = {q_params + c_params} total", flush=True)
@@ -138,8 +190,14 @@ def main() -> None:
         "n_features": args.n_features,
         "n_classes": data["n_classes"],
         "feature_indices": data["feature_indices"],
+        "feature_scores": data.get("feature_scores"),
         "label_classes": list(data["label_encoder"].classes_),
         "backend": args.backend,
+        "entangler": args.entangler,
+        "use_quantum": args.quantum,
+        "use_skip": args.skip,
+        "use_batchnorm": args.batchnorm,
+        "dropout": args.dropout,
     }
 
     resume_state = None
