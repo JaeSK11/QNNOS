@@ -11,6 +11,7 @@ data/*.csv
 # Training run artifacts (the published checkpoint model_out.pt/.json is kept)
 models/training_progress*.json
 models/training_log.txt
+models/*.resume.pt
 models/*.tmp
 
 # Python

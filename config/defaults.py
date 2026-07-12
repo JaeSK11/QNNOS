@@ -32,9 +32,9 @@ COLUMNS_TO_REMOVE = (
     [0]                        # src_ip string column prepended by the capture tooling
     + list(range(97, 130))     # IPv4 source address bits
     + list(range(130, 161))    # IPv4 destination address bits
-    + list(range(33, 49))      # TCP source/destination port bits
-    + list(range(480, 497))    # TCP seq/ack number bits
-    + list(range(496, 513))    # TCP seq/ack number bits
-    + list(range(512, 545))    # TCP seq/ack number bits
-    + list(range(544, 577))    # TCP seq/ack number bits
+    + list(range(33, 49))      # IPv4 identification field bits
+    + list(range(480, 497))    # TCP source/destination port bits
+    + list(range(496, 513))    # TCP source/destination port bits (cont.)
+    + list(range(512, 545))    # TCP sequence number bits
+    + list(range(544, 577))    # TCP acknowledgment number bits
 )
