@@ -100,8 +100,10 @@ packets. It only sees a clean tensor of 20 binary numbers.
 
   4. Encode labels: map OS names to integers 0-11.
 
-  5. Split: 80% training (2,155,786 packets), 20% test (538,947 packets),
+  5. Split: 80% training (86,113 packets), 20% test (21,529 packets),
      stratified so each OS has proportional representation in both sets.
+     (Counts are for Monday-WorkingHours_50th.csv, the ~107,642-row subset used
+     for training; the full Monday-WorkingHours.csv capture is ~2.7M rows.)
 
   6. Batch: group into batches of 512 packets for training.
 
@@ -618,18 +620,19 @@ each batch:
     - Same process with updated parameters
     - The model is slightly better now
 
-  Batch 3, 4, 5, ..., Batch 4,211:
+  Batch 3, 4, 5, ..., Batch 169:
     - Each batch makes the model a little better
 
-With 2,155,786 training samples and batch_size=512, that's 4,211 batches per
-epoch. At ~3.6 minutes per batch (217s), one epoch takes about 10.6 days.
+With 86,113 training samples and batch_size=512, that's 169 batches per epoch.
+At ~700 seconds per batch (measured on lightning.gpu with the triple-Pauli
+adjoint-diff circuit), one epoch takes about 33 hours.
 
 When all batches have been processed, that's one epoch.
 
 
 STEP 5: Validate and check early stopping
 
-After each epoch, the model is evaluated on the test set (538,947 packets that
+After each epoch, the model is evaluated on the test set (21,529 packets that
 were NOT used for training). The weighted F1 score measures how well the model
 classifies across all 12 OS classes.
 
@@ -970,11 +973,13 @@ Quantum model training:
   - Each of ~355 gates multiplies a matrix into this million-element vector.
   - The backward pass (adjoint differentiation) runs through all gates again
     in reverse.
-  - With 2,155,786 training samples at 512 per batch, that's 4,211 batches
-    per epoch. Each batch takes ~217 seconds (~3.6 minutes).
-  - One epoch: ~10.6 days.
-  - 50 epochs worst case: ~530 days (~1.5 years).
-  - With early stopping (patience=7): likely converges well before 50 epochs.
+  - With 86,113 training samples at 512 per batch, that's 169 batches
+    per epoch. Each batch takes ~700 seconds (~11.6 minutes) on lightning.gpu
+    with the triple-Pauli measurements (the PauliZ-only circuit was ~250s;
+    tripling the measured observables roughly triples the adjoint-diff cost).
+  - One epoch: ~33 hours.
+  - 50 epochs worst case: ~68 days.
+  - With early stopping (patience=10): likely converges well before 50 epochs.
 
 The quantum circuit is computing with a million-dimensional state vector for
 every single packet. XGBoost just follows a chain of if/then branches. This

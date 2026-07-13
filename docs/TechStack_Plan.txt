@@ -393,7 +393,11 @@ JSON config is used by load_checkpoint() to reconstruct the model architecture b
 
 nPrint CSV from CIC-IDS2017 Monday Working Hours capture (benign traffic only).
 
-- **Total samples**: 2,694,733 (80/20 split: 2,155,786 train / 538,947 test)
+- **Total samples**: 107,642 (80/20 split: 86,113 train / 21,529 test) — this is
+  `Monday-WorkingHours_50th.csv`, the subset actually used for training and for
+  every run below. (The full `Monday-WorkingHours.csv` capture is ~2.7M rows;
+  earlier drafts of this doc mistakenly quoted that 2.7M figure for the _50th
+  subset. At batch_size=512 the real subset is 169 batches/epoch, ~33 h/epoch.)
 - **Features**: 962 columns (961 binary nPrint features + 1 OS label)
 - **After column removal + SelectKBest**: 20 binary features
 
@@ -494,11 +498,11 @@ python QuantumNeuralNetworkOS/scripts/monitor.py QuantumNeuralNetworkOS/models
 
 ### Issue 3: Training Speed — Batch Size Too Small
 
-**Problem**: With batch_size=64 and 2,155,786 training samples, each epoch requires 33,685 batches. At ~27s/batch, one epoch takes ~10.5 days. 50 epochs would take ~1.4 years.
+**Problem**: With batch_size=64 and 86,113 training samples, each epoch requires 1,346 batches. At ~27s/batch, one epoch takes ~10 hours. 50 epochs would take ~21 days.
 
 **Root cause**: The quantum circuit processes samples sequentially (not batched at the GPU level). Each batch means 64 sequential circuit evaluations + 1 weight update. More batches = more overhead.
 
-**Decision**: Increase batch_size from 64 to 512 (8x fewer batches per epoch: 33,685 -> 4,211).
+**Decision**: Increase batch_size from 64 to 512 (8x fewer batches per epoch: 1,346 -> 169).
 
 **Why 512 and not 1024**:
 - Quantum circuits process samples one at a time, so larger batches don't parallelize the forward pass
@@ -591,7 +595,7 @@ gradient_clipping  | max_norm=1.0               | Caps gradient magnitude
 
 ### Run 1 Results (Monday-WorkingHours_50th.csv, 2026-04-05 to 2026-04-15)
 
-Trained 13 completed epochs over ~167 hours on the 50th percentile dataset (2,694,733 samples, imbalanced classes).
+Trained 13 completed epochs over ~167 hours on the 50th percentile dataset (107,642 samples, imbalanced classes).
 
 Epoch | Loss   | Accuracy | Val F1 | LR     | Notes
 ----- | ------ | -------- | ------ | ------ | -----
@@ -734,7 +738,7 @@ Changes made based on Run 1 analysis. All changes are zero-cost per batch (no in
 
 Setting            | Value                      | Was     | Reason
 ------------------ | -------------------------- | ------- | ------
-dataset            | Monday-WorkingHours_balanced_11th.csv | Monday-WorkingHours_50th.csv | Balanced classes (~8,500 per class) eliminate imbalance noise; 103K samples vs 2.7M (26x smaller, faster epochs)
+dataset            | Monday-WorkingHours_balanced_11th.csv | Monday-WorkingHours_50th.csv | Balanced classes (~8,500 per class) eliminate imbalance noise; ~103K samples, comparable in size to _50th (~108K), NOT 26x smaller (an earlier draft wrongly assumed _50th was 2.7M) — so epoch speed was not actually a reason
 learning_rate      | 0.003                      | 0.01    | Run 1 showed lower LR = better results; 0.01→0.005 halving immediately produced best epochs
 gradient_clipping  | max_norm=0.5               | 1.0     | Tighter clipping prevents catastrophic collapses seen at epochs 6 and 8
 classical_head     | Linear(20,64)->ReLU->Linear(64,12) | Linear(20,32)->ReLU->Linear(32,12) | Doubles classical capacity (2,124 vs 1,068 params) at zero compute cost; helps separate quantum embeddings
@@ -853,7 +857,7 @@ make clean
 
 ### Run 3 Results (Monday-WorkingHours_50th.csv, 2026-04-21 to 2026-05-07)
 
-Trained 26 completed epochs over ~2 weeks on the 50th percentile dataset (2,694,733 samples, imbalanced classes). Circuit changes: star topology + data re-uploading. Hyperparameter changes: LR=0.005, warmup=3, grad_clip=0.75, classical_head=Linear(20,64)->ReLU->Linear(64,12).
+Trained 26 completed epochs over ~2 weeks on the 50th percentile dataset (107,642 samples, imbalanced classes). Circuit changes: star topology + data re-uploading. Hyperparameter changes: LR=0.005, warmup=3, grad_clip=0.75, classical_head=Linear(20,64)->ReLU->Linear(64,12).
 
 Epoch | Loss   | Accuracy | Val F1 | LR     | Notes
 ----- | ------ | -------- | ------ | ------ | -----
