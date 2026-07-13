@@ -2,6 +2,8 @@
 
 import json
 import os
+import signal
+import sys
 import time
 
 import torch
@@ -66,6 +68,44 @@ class FocalLoss(nn.Module):
 EPOCH_LOG_FILE = "training_log.txt"
 PROGRESS_INTERVAL = 10  # write progress every N batches
 LOG_GRAD_INTERVAL = 50  # log gradient norms every N batches
+# Persist full resume state mid-epoch every N batches. Epochs can run for days
+# on the large dataset; without this a hard kill (SIGKILL/OOM/power loss) would
+# discard the whole in-flight epoch. The .resume.pt write is ~40 MB, cheap
+# relative to a ~700s batch.
+RESUME_CHECKPOINT_INTERVAL = 50
+
+# Markers appended to EPOCH_LOG_FILE so the *next* run can tell how the previous
+# one ended (clean END, caught-signal SHUTDOWN, or nothing => abrupt kill).
+_RUN_MARKERS = ("=== RUN START", "=== RUN END", "=== RUN SHUTDOWN")
+
+
+def append_log_line(save_dir: str, line: str) -> None:
+    """Append a single raw line to the human-readable training log."""
+    path = os.path.join(save_dir, EPOCH_LOG_FILE)
+    os.makedirs(save_dir, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(line.rstrip("\n") + "\n")
+
+
+def prior_run_exited_uncleanly(save_dir: str) -> bool:
+    """True if the last run marker in the log is a START with no matching
+    END/SHUTDOWN — i.e. the previous process was killed without catching a
+    signal (SIGKILL, kernel OOM, or host power loss). A caught SIGTERM writes
+    a SHUTDOWN marker, and a normal finish writes END, so either of those
+    means the prior exit was accounted for.
+    """
+    path = os.path.join(save_dir, EPOCH_LOG_FILE)
+    if not os.path.exists(path):
+        return False
+    last = None
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith(_RUN_MARKERS):
+                    last = line
+    except OSError:
+        return False
+    return last is not None and last.startswith("=== RUN START")
 
 
 def get_progress_filename(model_name: str, start_date: str) -> str:
@@ -257,10 +297,78 @@ def train_model(
     training_start = time.time()
     start_date = time.strftime("%Y-%m-%d")
 
+    # --- Crash forensics + graceful shutdown ---------------------------------
+    # If the previous run left a START with no END/SHUTDOWN, it was killed
+    # abruptly (SIGKILL/OOM/power loss) rather than stopped gracefully. Record
+    # that in-repo; the authoritative cause still comes from `docker inspect`
+    # (OOMKilled/ExitCode) and journald around that timestamp.
+    if prior_run_exited_uncleanly(save_dir):
+        note = (f"NOTE {time.strftime('%Y-%m-%d %H:%M:%S')}: previous run left no "
+                f"END/SHUTDOWN marker -> killed abruptly (SIGKILL/OOM/power loss), "
+                f"not a graceful stop. Confirm with `docker inspect` OOMKilled and "
+                f"journald around the prior FinishedAt.")
+        append_log_line(save_dir, note)
+        print(note, flush=True)
+
+    append_log_line(
+        save_dir,
+        f"=== RUN START {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} "
+        f"host={os.uname().nodename} model={model_name} "
+        f"resume_from_epoch={start_epoch} ===",
+    )
+
+    # Persist the config JSON up front (not just on the first best-F1 epoch) so
+    # a restart can `--resume` as soon as the mid-epoch .resume.pt exists —
+    # critical when a single epoch runs for days on the large dataset.
+    if config is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        with open(os.path.join(save_dir, f"{model_name}.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+    # Mutable view of loop position so the signal handler can report exactly
+    # where we were and persist a resume checkpoint before exiting.
+    live = {
+        "epoch": start_epoch, "batch": 0, "total_batches": total_batches,
+        "best_f1": best_f1, "best_epoch": best_epoch,
+        "epochs_without_improvement": epochs_without_improvement,
+    }
+
+    def _handle_shutdown(signum, _frame):
+        # Reached only at a Python bytecode boundary, i.e. BETWEEN batches. A
+        # signal arriving mid-batch waits for that ~700s batch to finish, so
+        # Docker's stop_grace_period must exceed one batch for this to fire
+        # before SIGKILL. The periodic mid-epoch checkpoint is the guaranteed
+        # durability path; this handler is best-effort forensics + a final save.
+        name = signal.Signals(signum).name
+        msg = (f"=== RUN SHUTDOWN {time.strftime('%Y-%m-%d %H:%M:%S')}: caught "
+               f"{name} at epoch {live['epoch'] + 1}, "
+               f"batch {live['batch']}/{live['total_batches']} — "
+               f"checkpointing then exiting ===")
+        append_log_line(save_dir, msg)
+        print("\n" + msg, flush=True)
+        if config is not None:
+            # epoch index (not +1) => resume re-runs this epoch from batch 0
+            # with the partially-updated (warm) weights.
+            save_resume_checkpoint(save_dir, model_name, {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": live["epoch"],
+                "best_f1": live["best_f1"],
+                "best_epoch": live["best_epoch"],
+                "epochs_without_improvement": live["epochs_without_improvement"],
+            })
+            append_log_line(save_dir, f"    resume checkpoint saved at epoch {live['epoch'] + 1}")
+        sys.exit(128 + signum)  # conventional exit code for a signal death
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
     # Write header for epoch log
     write_epoch_log(save_dir, 0, epochs, 0, 0, 0, 0, 0, lr, [], 0, header=True)
 
     for epoch in range(start_epoch, epochs):
+        live["epoch"] = epoch
         # LR warmup: linearly ramp from lr/10 to lr over warmup epochs
         if epoch < LR_WARMUP_EPOCHS:
             warmup_lr = lr * (0.1 + 0.9 * epoch / max(LR_WARMUP_EPOCHS - 1, 1))
@@ -297,7 +405,23 @@ def train_model(
             optimizer.step()
             epoch_loss += loss.item()
             n_batches += 1
+            live["batch"] = n_batches
             batch_elapsed = time.time() - batch_start
+
+            # Mid-epoch durability: persist full resume state periodically so a
+            # hard kill loses at most a few hours, not the whole multi-day
+            # epoch. epoch index (not +1) => resume re-runs the current epoch
+            # from batch 0 with the partially-updated weights.
+            if config is not None and n_batches % RESUME_CHECKPOINT_INTERVAL == 0:
+                save_resume_checkpoint(save_dir, model_name, {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "best_f1": best_f1,
+                    "best_epoch": best_epoch,
+                    "epochs_without_improvement": epochs_without_improvement,
+                })
 
             if log_grads:
                 clipped = " CLIPPED" if pre_clip_norm > MAX_GRAD_NORM else ""
@@ -427,6 +551,9 @@ def train_model(
             "learning_rate": current_lr,
         }, model_name, start_date)
 
+        live.update(best_f1=best_f1, best_epoch=best_epoch,
+                    epochs_without_improvement=epochs_without_improvement)
+
         # Persist full state every epoch so a crash/daemon-restart can resume
         # from exactly here (next epoch index = epoch + 1).
         save_resume_checkpoint(save_dir, model_name, {
@@ -442,6 +569,13 @@ def train_model(
         if epochs_without_improvement >= patience:
             print(f"Early stopping at epoch {epoch + 1}")
             break
+
+    append_log_line(
+        save_dir,
+        f"=== RUN END {time.strftime('%Y-%m-%d %H:%M:%S')} clean: "
+        f"best_f1={best_f1:.4f} @ epoch {best_epoch}, "
+        f"last_epoch={live['epoch'] + 1} ===",
+    )
 
     history["best_epoch"] = best_epoch
     history["best_f1"] = best_f1

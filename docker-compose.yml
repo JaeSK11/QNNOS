@@ -7,6 +7,12 @@ services:
     # than restarting from scratch. "unless-stopped" won't restart after an
     # explicit `docker compose stop`.
     restart: unless-stopped
+    # Give the trainer's SIGTERM handler time to flush a resume checkpoint on a
+    # graceful stop. Best-effort: a signal arriving mid-batch isn't handled
+    # until that ~700s batch ends, so the periodic mid-epoch checkpoint (every
+    # 50 batches) is the real durability guarantee. 120s covers a between-batch
+    # catch + the ~40MB checkpoint write without unduly delaying host shutdowns.
+    stop_grace_period: 120s
     deploy:
       resources:
         reservations:
@@ -19,4 +25,9 @@ services:
     volumes:
       - ./data:/workspace/data
       - ./models:/workspace/models
-    command: python scripts/train.py data/Monday-WorkingHours_balanced_11th.csv model_out --backend lightning.gpu --resume
+    # Invoked as a module (not `python scripts/train.py`) so the script's own
+    # directory is NOT prepended to sys.path. (scripts/inspect.py was renamed to
+    # inspect_model.py to stop it shadowing the stdlib `inspect` module, which
+    # made newer numpy/pandas crash on import; `-m` is kept as belt-and-suspenders
+    # against any future same-name collision.)
+    command: python -m scripts.train data/Monday-WorkingHours_50th.csv model_out --backend lightning.gpu --skip --batchnorm --dropout 0.1 --resume

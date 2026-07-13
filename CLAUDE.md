@@ -28,7 +28,7 @@ python scripts/train.py data/nprint.csv model_out --backend lightning.gpu
 python scripts/test.py data/nprint.csv models/model_out --backend lightning.gpu
 
 # Inspect: feature-importance ranking + pre/post-circuit data snapshots
-python scripts/inspect.py data/nprint.csv models/model_out --backend lightning.qubit --n-samples 5
+python scripts/inspect_model.py data/nprint.csv models/model_out --backend lightning.qubit --n-samples 5
 
 # Unit tests
 pytest tests/
@@ -49,7 +49,7 @@ docker compose up quantum-train
 - `evaluation/inspection.py` - feature-importance ranking + pre/post-circuit data snapshots
 - `scripts/train.py` - CLI entrypoint for training (prints feature-importance ranking; saves `feature_scores` in config)
 - `scripts/test.py` - CLI entrypoint for evaluation
-- `scripts/inspect.py` - CLI: feature importance + circuit-boundary snapshots (writes `<model>_inspection.{json,txt}`)
+- `scripts/inspect_model.py` - CLI: feature importance + circuit-boundary snapshots (writes `<model>_inspection.{json,txt}`). Named `inspect_model` (not `inspect`) so running it as `python scripts/inspect_model.py` cannot shadow the stdlib `inspect` module on sys.path.
 
 ## Testing
 

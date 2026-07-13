@@ -111,6 +111,17 @@ def main() -> None:
 
     saved_config = None
     feature_indices = None
+    # Resume-or-fresh: with --resume but no prior checkpoint (the very first
+    # launch), start fresh instead of erroring. This lets the container command
+    # carry --resume permanently so every auto-restart continues the run, while
+    # the first launch bootstraps it.
+    if args.resume and not (Path(args.save_dir) / f"{args.model_name}.json").exists():
+        print(
+            f"--resume set but no checkpoint at {args.save_dir}/{args.model_name}.json; "
+            f"starting a fresh run.",
+            flush=True,
+        )
+        args.resume = False
     if args.resume:
         saved_config = load_saved_config(args.save_dir, args.model_name)
         # Lock architecture and feature basis to the checkpoint being resumed.
@@ -214,28 +225,35 @@ def main() -> None:
             model.load_state_dict(resume_state["model"])
             print(f"Loaded full resume state; continuing from epoch {resume_state['epoch']}.", flush=True)
         else:
-            # No full resume checkpoint (run predates resume support): warm-start
-            # from the best-weights checkpoint and protect it with its known F1.
+            # No full resume checkpoint. Either the run predates resume support
+            # (warm-start from best weights), or it died before the first
+            # mid-epoch checkpoint was written (no weights yet -> start fresh
+            # rather than crash-loop the auto-restart).
             best_path = Path(args.save_dir) / f"{args.model_name}.pt"
             if not best_path.exists():
-                raise SystemExit(
-                    f"--resume set but no resume or weights checkpoint found in {args.save_dir}."
+                print(
+                    "--resume set but no resume-state or best-weights checkpoint yet "
+                    "(crash before the first mid-epoch save); starting fresh from "
+                    "epoch 0 with the saved feature/label basis.",
+                    flush=True,
                 )
-            model.load_state_dict(torch.load(best_path, weights_only=True))
-            seed_f1, seed_epoch = latest_best(args.save_dir, args.model_name)
-            resume_state = {
-                "optimizer": None,
-                "scheduler": None,
-                "epoch": 0,
-                "best_f1": seed_f1,
-                "best_epoch": seed_epoch,
-                "epochs_without_improvement": 0,
-            }
-            print(
-                f"Warm-starting from best weights (seed best_f1={seed_f1:.4f} "
-                f"@ epoch {seed_epoch}); optimizer/scheduler reset, LR warmup re-runs.",
-                flush=True,
-            )
+                resume_state = None
+            else:
+                model.load_state_dict(torch.load(best_path, weights_only=True))
+                seed_f1, seed_epoch = latest_best(args.save_dir, args.model_name)
+                resume_state = {
+                    "optimizer": None,
+                    "scheduler": None,
+                    "epoch": 0,
+                    "best_f1": seed_f1,
+                    "best_epoch": seed_epoch,
+                    "epochs_without_improvement": 0,
+                }
+                print(
+                    f"Warm-starting from best weights (seed best_f1={seed_f1:.4f} "
+                    f"@ epoch {seed_epoch}); optimizer/scheduler reset, LR warmup re-runs.",
+                    flush=True,
+                )
 
     print("Training...")
     history = train_model(
