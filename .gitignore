@@ -41,3 +41,6 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# Local AI-assistant project notes (not part of the published repo)
+CLAUDE.md

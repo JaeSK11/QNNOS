@@ -127,7 +127,6 @@ Location: repository root
 ### Directory Structure
 
 QuantumNeuralNetworkOS/
-├── CLAUDE.md
 ├── README.md
 ├── requirements.txt
 ├── Dockerfile
@@ -484,7 +483,7 @@ python scripts/monitor.py models
  7. evaluation/metrics.py                           -- accuracy, F1, classification_report
  8. scripts/train.py + test.py + monitor.py         -- CLI entrypoints
  9. tests/                                          -- all test files
-10. requirements.txt + Makefile + README.md + CLAUDE.md
+10. requirements.txt + Makefile + README.md
 
 ---
 
