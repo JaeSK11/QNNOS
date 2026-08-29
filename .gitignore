@@ -8,11 +8,24 @@ venv/
 data/*.csv
 !data/labels.csv
 
-# Training run artifacts (the published checkpoint model_out.pt/.json is kept)
+# Training run artifacts (published checkpoints models/*.pt + *.json are kept)
 models/training_progress*.json
 models/training_log.txt
 models/*.resume.pt
 models/*.tmp
+
+# Generated evaluation/inspection outputs
+models/*_inspection.json
+models/*_inspection.txt
+models/*_heldout.txt
+models/*_heldout_preds.npz
+
+# Local scratch analyses and archived runs (kept on disk, not published)
+models/_*
+models/archive_*/
+
+# Slide decks and other presentation files
+*.pptx
 
 # Python
 __pycache__/

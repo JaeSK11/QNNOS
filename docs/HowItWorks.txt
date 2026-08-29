@@ -19,17 +19,18 @@ The model has two parts:
      -- these are just floating point numbers like 0.47 or -1.23, initialized
      randomly.
 
-  2. A classical neural network head with 8,844 trainable parameters (regular
+  2. A classical neural network head with 9,356 trainable parameters (regular
      matrix weights and biases), also initialized randomly.
 
 Before training, the model knows nothing. Every packet gets essentially random
 scores for each OS class.
 
-Total trainable parameters: 160 quantum + 8,844 classical = 9,004.
+Total trainable parameters: 160 quantum + 9,356 classical = 9,516.
 
 For comparison, XGBoost uses ~300,000 decision rules across 300+ trees. The
-quantum model tries to accomplish the same task with ~33x fewer parameters by
-operating in an exponentially larger mathematical space.
+quantum model tries to accomplish the same task with ~30x fewer parameters,
+betting that the exponentially larger state space compensates. (Whether it
+does is measured in the final section: on the same 20 features it ties XGBoost.)
 
 ---
 
@@ -61,11 +62,15 @@ Where the 20 features come from (classical data pipeline)
 
 Before anything quantum happens, the data goes through a purely classical
 preprocessing pipeline. This is important: the quantum circuit never sees raw
-packets. It only sees a clean tensor of 20 binary numbers.
+packets. It only sees a clean tensor of 20 ternary numbers.
 
   1. Start with an nPrint CSV file. Each row is one network packet, with 962
-     columns: 961 binary features extracted from packet headers (IPv4, TCP, etc.)
-     plus 1 label column (the OS that sent the packet).
+     columns: 961 per-bit features extracted from packet headers (IPv4, TCP,
+     etc.) plus 1 label column (the OS that sent the packet). Each feature is
+     1 (bit set), 0 (bit clear), or -1 (the field is absent from this packet
+     entirely — e.g. every TCP options bit in a packet with no options).
+     The -1s dominate: across the 20 selected features, 58% of all values
+     are -1, 26% are 0, and 16% are 1.
 
   2. Remove identifying columns that would let the model cheat:
      - IPv4 source/destination addresses (columns 97-160)
@@ -78,25 +83,31 @@ packets. It only sees a clean tensor of 20 binary numbers.
      fail on any other network. We want the model to learn OS signatures from
      protocol behavior, not network topology.
 
-  3. Select the 20 most informative features using mutual information
-     (SelectKBest with mutual_info_classif). This measures the non-linear
-     statistical dependency between each feature and the class labels. Features
-     that carry the most information about which OS sent the packet score
-     highest. The selector is fitted only on training data to avoid data
-     leakage.
+  3. Pick the 20 feature columns the circuit will see (one per qubit). Two
+     mechanisms exist, and which one a model used is stored in its config:
 
-     Previously tried f_classif (ANOVA F-scores) in Run 4, which computes
-     between-class vs within-class variance. While theoretically class-aware,
-     f_classif selected 14/20 features with nearly identical F-scores (~7856)
-     — correlated TCP option bits carrying redundant information. This caused
-     a severe regression (F1 dropped 69%, from 0.3510 to 0.1080). Reverted to
-     mutual_info_classif, which handles correlated binary features better by
-     measuring non-linear dependency, producing features with varied scores
-     (0.28-0.68) across diverse parts of the TCP/IP stack.
+     a) CURRENT (model_xgb20, since 2026-07-27): an explicit feature list via
+        --feature-names, taken from an XGBoost model's gain ranking. A
+        gradient-boosted classifier is trained on all 783 leak-free columns
+        (identifier columns removed), and the top 20 features by gain --
+        how much each feature actually improved that model's splits -- become
+        the qubit assignment. Gain ranking is supervised and multivariate
+        (a feature scores high for being USEFUL in combination), and it
+        surfaced tcp_wsize_* window-size bits and control-flag bits that the
+        univariate ranking below missed. See docs/DECISIONS.txt Decision 9.
 
-     The selected features tend to be specific bits from TCP flags, window size
-     fields, TTL patterns, and TCP options -- the parts of packet headers where
-     different OS TCP/IP stacks behave differently.
+     b) DEFAULT (earlier runs): SelectKBest with mutual_info_classif, which
+        scores each feature independently by its non-linear statistical
+        dependency with the class labels. The selector is fitted only on
+        training data to avoid leakage. Run 4 tried f_classif (ANOVA F-scores)
+        instead: it picked 14/20 near-identical correlated TCP option bits and
+        caused a severe regression (F1 dropped 69%, 0.3510 -> 0.1080), so it
+        was reverted -- mutual information handles correlated binary features
+        better, producing varied scores (0.28-0.68) across the stack.
+
+     Either way, the selected features tend to be specific bits from TCP
+     flags, window size fields, TTL patterns, and TCP options -- the parts of
+     packet headers where different OS TCP/IP stacks behave differently.
 
   4. Encode labels: map OS names to integers 0-11.
 
@@ -108,57 +119,72 @@ packets. It only sees a clean tensor of 20 binary numbers.
   6. Batch: group into batches of 512 packets for training.
 
 Output to the quantum circuit: a tensor of shape (512, 20) -- 512 packets,
-each with 20 binary features (0 or 1). No normalization needed because nPrint
-features are already binary.
+each with 20 ternary features (-1, 0, or 1). No normalization needed because
+nPrint features already take exactly these three values; the encoding stage
+maps them to three fixed rotation angles.
 
 ---
 
 How a single packet gets processed (forward pass)
 
 Let's trace one network packet through the entire model. Say this packet came
-from a Windows-10 machine. After the classical data pipeline, we have 20 binary
-features selected from the packet headers:
+from a Windows-10 machine. After the classical data pipeline, we have 20
+ternary features selected from the packet headers:
 
-  Packet features: [1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0]
+  Packet features: [1, 0, 1, 1, -1, -1, 1, 0, 1, 1, 0, 1, -1, 0, 1, 1, 0, 1, 1, 0]
 
 These 20 values are specific bits from the packet's IPv4 and TCP headers --
-things like TTL bit patterns, TCP flags, window size bits, and option fields.
-The 20 most informative bits were chosen by mutual information feature selection
-during preprocessing.
+things like TTL bit patterns, TCP flags, window size bits, and option fields
+(1 = bit set, 0 = bit clear, -1 = field absent from this packet). The 20 bits
+were chosen during preprocessing -- XGBoost gain ranking for the current
+model_xgb20, mutual information for earlier runs (see step 3 above).
 
 
 STAGE 1: Encoding the packet into qubits
 
 Each of the 20 features gets encoded into one qubit using an RY rotation gate:
 
-  feature value x pi = rotation angle
+  (feature value + 1) x pi/2 = rotation angle
 
-  Feature 0 = 1  ->  RY(1 x pi) = RY(pi)   ->  qubit 0 rotates to |1> (arrow points down)
-  Feature 1 = 0  ->  RY(0 x pi) = RY(0)    ->  qubit 1 stays at |0> (arrow points up)
-  Feature 2 = 1  ->  RY(1 x pi) = RY(pi)   ->  qubit 2 rotates to |1>
-  Feature 3 = 1  ->  RY(1 x pi) = RY(pi)   ->  qubit 3 rotates to |1>
-  Feature 4 = 0  ->  RY(0 x pi) = RY(0)    ->  qubit 4 stays at |0>
+  Feature 0 = 1   ->  RY(2 x pi/2) = RY(pi)    ->  qubit 0 rotates to |1> (arrow points down)
+  Feature 1 = 0   ->  RY(1 x pi/2) = RY(pi/2)  ->  qubit 1 rotates to the equator (equal superposition)
+  Feature 2 = 1   ->  RY(2 x pi/2) = RY(pi)    ->  qubit 2 rotates to |1>
+  Feature 3 = 1   ->  RY(2 x pi/2) = RY(pi)    ->  qubit 3 rotates to |1>
+  Feature 4 = -1  ->  RY(0 x pi/2) = RY(0)     ->  qubit 4 stays at |0> (arrow points up)
   ...and so on for all 20 qubits.
 
-This is implemented as qml.AngleEmbedding(inputs * pi, rotation="Y") in
-PennyLane. One line of code, but it creates the foundation for everything
+This is implemented as qml.AngleEmbedding((inputs + 1) * pi/2, rotation="Y")
+in PennyLane. One line of code, but it creates the foundation for everything
 that follows.
+
+Why the (x + 1) * pi/2 shift instead of the more obvious x * pi? Because the
+naive encoding has a genuinely quantum bug: RY(-pi) = -RY(pi) -- the two
+rotations differ only by a global phase, which no measurement can ever see.
+Under x * pi, a -1 ("field absent") and a +1 ("bit set") would enter the
+circuit as physically identical states, and 58% of the data values are -1.
+The shifted encoding gives each of the three values its own Bloch latitude:
+
+  -1 (absent) -> |0>          (north pole)
+   0 (clear)  -> equator      (equal superposition of |0> and |1>)
+   1 (set)    -> |1>          (south pole)
 
 After encoding, the 20-qubit register looks like:
 
-  q0:  |1>     (feature was 1)
-  q1:  |0>     (feature was 0)
-  q2:  |1>     (feature was 1)
-  q3:  |1>     (feature was 1)
-  q4:  |0>     (feature was 0)
-  q5:  |0>     (feature was 0)
-  q6:  |1>     (feature was 1)
+  q0:  |1>          (feature was 1)
+  q1:  equator      (feature was 0)
+  q2:  |1>          (feature was 1)
+  q3:  |1>          (feature was 1)
+  q4:  |0>          (feature was -1)
+  q5:  |0>          (feature was -1)
+  q6:  |1>          (feature was 1)
   ...
-  q19: |0>     (feature was 0)
+  q19: equator      (feature was 0)
 
 Right now, each qubit is independent -- it only knows about its own feature.
 The full 20-qubit state is just the product of the individual states. No
-quantum advantage yet.
+quantum advantage yet. Note that unlike the old binary encoding, the state is
+no longer a computational basis state: every 0-valued feature contributes a
+superposition.
 
 
 STAGE 2: Entanglement (ring topology)
@@ -195,15 +221,18 @@ but meaningful propagation). The cost vs star is just 1 extra CNOT per layer
 
 After the ring CNOTs on our example packet:
 
-  q0 = |1>, so CNOT flips q1:    q1 goes from |0> to |1>
-  q1 = |1>, so CNOT flips q2:    q2 goes from |1> to |0>
-  q2 = |0>, so CNOT leaves q3:   q3 stays at |1>
-  ...each qubit's state depends on its neighbor.
+  q0 = |1>, so CNOT flips q1's poles: the equator state picks up q0's flip
+  q1 is on the equator (superposition), so CNOT(q1, q2) ENTANGLES q1 and q2
+  q4 = |0>, so CNOT leaves q5 unchanged
+  ...each qubit's state becomes correlated with its neighbor.
 
-For binary inputs, this stage just does classical XOR with the neighbor. But its
-real purpose is structural -- in later layers when the qubits are in
-superposition, these CNOT gates create genuine quantum entanglement that lets
-the circuit capture correlations between features.
+Under the old binary encoding this stage was just a classical XOR with the
+neighbor (basis states in, basis states out -- no entanglement). With the
+ternary encoding, every 0-valued feature sits on the equator in superposition,
+so this first ring already creates genuine entanglement for typical packets.
+Its role in later layers is unchanged: after the trainable rotations put all
+qubits into superposition, these CNOT gates let the circuit capture
+correlations between features.
 
 This is analogous to XGBoost's tree depth: a depth-10 tree can combine up to 10
 features in a single decision path. Entanglement lets the quantum circuit combine
@@ -227,11 +256,31 @@ from (4, 20, 2) = 160 to (4, 20, 3) = 240 params. A "crz" checkpoint is NOT
 weight-compatible with a "cnot" one, so switching needs a fresh run under a new
 model name.
 
-Why is "cnot" still the default? It is cheaper, and on the near-classical states
-produced by binary RY encoding (recall from Stage 2 that the first ring does no
-entangling work on basis states) the fixed ring is already enough structure. "crz" is the thing
-to try once the encoding produces genuinely entangled states -- that is where a
-learnable coupling strength has something to bite on.
+Why is "cnot" still the default? It is the cheapest, and it is the
+configuration the earlier runs were produced with. The production model
+(model_xgb20) uses "ring_long": the same fixed CNOT ring plus long-range
+shortcuts, described below. Note that with the ternary encoding
+the old argument for it has weakened: the encoding now produces genuine
+superposition (0-valued features sit on the equator), so a learnable coupling
+strength has something to bite on from the very first ring -- "crz" is worth
+re-evaluating in a future run.
+
+Long-range shortcuts (Run 7, 2026-07-24)
+
+A third entangler, ENTANGLER="ring_long" (--entangler ring_long), keeps the
+fixed nearest-neighbor ring but ADDS extra fixed CNOTs between qubits i and
+(i+k) % 20 for each offset k in SHORTCUT_OFFSETS (default [5, 10]). Offset 10
+links antipodal qubits; offset 5 links quarter-way-around pairs. The point is
+reachability: on a plain ring, qubits 10 apart need up to 10 hops, and 4 layers
+only propagate correlations a few hops, so distant feature pairs -- exactly the
+ones that would distinguish windows-10 from windows-10-pro -- can barely
+interact. The shortcuts shrink the ring's graph diameter so any two qubits can
+correlate within a couple of layers. Because the shortcuts are FIXED CNOTs, this
+adds ZERO parameters (weight tensor stays (4, 20, 2) = 160) and no
+parameter-count barren-plateau risk -- unlike full all-to-all (190 trainable CRZ
+pairs/layer), which was measured at ~118 h/epoch on lightning.gpu adjoint (~5
+DAYS/epoch) and is impractical to train. The 2026-07-24 run "model_ringlong" uses
+ring_long with offsets [5, 10]. See docs/DECISIONS.txt Decision 7.
 
 
 STAGE 3: Variational layers with data re-uploading (where learning happens)
@@ -249,13 +298,13 @@ Let's walk through Layer 1:
 
   First, re-encode the original packet features into the qubits:
 
-    qml.AngleEmbedding(inputs * pi, rotation="Y")
+    qml.AngleEmbedding((inputs + 1) * pi/2, rotation="Y")
 
   This is the same encoding as Stage 1, applied again. Why re-upload the data?
   Without it, the circuit only sees the input once at the start. The variational
   layers then operate on a fixed encoded state, which limits the circuit to
   learning first-order Fourier series of the input -- essentially linear decision
-  boundaries per layer. With 12 OS classes sharing similar binary patterns, linear
+  boundaries per layer. With 12 OS classes sharing similar feature patterns, linear
   boundaries are insufficient.
 
   Data re-uploading gives the circuit universal approximation capability: each
@@ -297,7 +346,7 @@ Let's walk through Layer 1:
 
 Then Layer 2 repeats with its own 40 trainable angles (different from Layer 1):
 
-    Re-upload: AngleEmbedding(inputs * pi) again
+    Re-upload: AngleEmbedding((inputs + 1) * pi/2) again
     Qubit 0:  RY(weights[1,0,0])  then  RZ(weights[1,0,1])
     Qubit 1:  RY(weights[1,1,0])  then  RZ(weights[1,1,1])
     ...
@@ -322,9 +371,11 @@ a vector of 2^20 = 1,048,576 complex numbers. This is what the GPU simulator
 is actually computing: matrix multiplications on a million-element vector.
 
 
-STAGE 4: Measurement (triple Pauli)
+STAGE 4: Measurement (triple Pauli -- the 60-observable default)
 
-Now we measure each qubit on THREE axes. For each qubit i, we compute:
+This stage describes the default configuration. The production model measures
+PauliZ only (20 outputs); see "Configurable measurement axes" at the end of
+this stage for why. Now we measure each qubit on THREE axes. For each qubit i, we compute:
 
   <PauliZ(i)> = expectation value of the Pauli Z operator on qubit i
   <PauliX(i)> = expectation value of the Pauli X operator on qubit i
@@ -366,10 +417,27 @@ In the code, this is:
   [qml.expval(obs(i)) for obs in (qml.PauliZ, qml.PauliX, qml.PauliY)
    for i in range(20)]
 
+Configurable measurement axes (Run 7, 2026-07-24)
+
+The measured axes are now configurable via MEASURE_AXES / --measure-axes. The
+default ["Z","X","Y"] reproduces the 60-output behavior described above. The
+important caveat: the "3x more information ... with zero additional gate cost"
+framing is true for a forward pass but NOT for TRAINING cost. Adjoint
+differentiation re-runs its backward sweep once PER measured observable, so 60
+observables cost roughly 3x the gradient time of PauliZ-only. Benchmarked on
+lightning.gpu: 60 obs = 1.35 s/sample (~32h/epoch) vs 20 obs (Z only) = 0.49
+s/sample (~11.7h/epoch). The 2026-07-24 run "model_ringlong" therefore uses
+--measure-axes Z (20 outputs) to make the experiment iterable (~14h/epoch
+combined with ring_long's extra gates). If a future run shows PauliX/PauliY
+materially help accuracy, restore them. See docs/DECISIONS.txt Decision 8.
+
 
 STAGE 5: Classical head (mapping measurements to OS classes)
 
-The 60 measurement values go into a classical neural network:
+The 60 measurement values go into a classical neural network. (This walkthrough
+uses the 60-input default; the production head is BatchNorm1d(40) ->
+Linear(40,128) -> ... with Z-only measurement plus --skip, and the mechanics
+are identical at width 40 -- see "Current production configuration" below.)
 
   Step 1: Linear layer -- multiply by a 128x60 weight matrix + bias
     60 values  ->  128 values
@@ -423,9 +491,9 @@ so test.py and --resume rebuild the exact same head. Defaults reproduce the
 original behavior above; each option targets a specific weakness.
 
   --batchnorm  (BatchNorm1d on the 60 head inputs)
-      Why: the 60 inputs are on wildly different scales. On the near-basis
-      states this circuit produces, the 20 PauliZ values sit near +/-1 while the
-      40 PauliX/PauliY values cluster near 0 with tiny variance. A single Linear
+      Why: the 60 inputs are on very different scales. The 20 PauliZ values
+      spread across [-1, +1] while the 40 PauliX/PauliY values cluster near 0
+      with small variance. A single Linear
       layer is poorly conditioned when its inputs span such different scales.
       BatchNorm1d normalizes each of the 60 features to zero mean / unit variance
       ACROSS the batch, which is the right tool for per-feature scale disparity
@@ -457,9 +525,17 @@ original behavior above; each option targets a specific weakness.
       not earning its keep and effort belongs in the encoding/feature selection.
 
 Head input dimension follows the flags: 60 (quantum only, default), 80 (quantum
-+ skip), or 20 (classical baseline: --no-quantum --skip). Because these change
++ skip), 40 (Z-only quantum + skip -- the production model), or 20 (classical
+baseline: --no-quantum --skip). Because these change
 Linear shapes, a variant checkpoint is not weight-compatible with the default;
 use a distinct model name when A/B-ing.
+
+Current production configuration (model_xgb20, 2026-07-27 -> 2026-08-04):
+--measure-axes Z --skip --batchnorm --dropout 0.1 with the ring_long entangler.
+With Z-only measurement the quantum output is 20 expvals, so the head input is
+20 + 20 skip = 40: BatchNorm1d(40) -> Linear(40,128) -> ReLU -> Dropout(0.1) ->
+Linear(128,12). The walkthrough above uses the 60-observable default for its
+worked examples; the mechanics are identical at width 40.
 
 ---
 
@@ -528,14 +604,14 @@ complementary.
 STEP 2: Compute gradients (backward pass)
 
 This is where quantum computing gets interesting. We need to figure out: for
-each of the 9,004 trainable parameters, which direction should we nudge it to
+each of the 9,516 trainable parameters, which direction should we nudge it to
 reduce the loss?
 
 The gradient tells us: "if you increase this parameter by a tiny amount, the
 loss goes up by X" (positive gradient) or "the loss goes down by X" (negative
 gradient).
 
-For the classical head (2,124 parameters):
+For the classical head (9,356 parameters):
   Standard backpropagation -- the same algorithm used in any neural network.
   Chain rule through the linear layers and ReLU.
 
@@ -567,7 +643,7 @@ After the backward pass, we have a gradient for every parameter:
   Classical head gradient:
     linear1.weight[0,0]:  gradient = -0.045
     linear1.weight[0,1]:  gradient = +0.023
-    ...all 2,124 classical parameters get a gradient.
+    ...all 9,356 classical parameters get a gradient.
 
 Gradient clipping: before the optimizer uses these gradients, they are clipped
 to a maximum norm of 0.75. This prevents any single batch from making a
@@ -602,7 +678,7 @@ Learning rate schedule:
     solution but overshooting.
   - Floor: LR never drops below 1e-5.
 
-After the optimizer step, all 9,004 parameters have been nudged slightly.
+After the optimizer step, all 9,516 parameters have been nudged slightly.
 
 
 STEP 4: Repeat for the next batch
@@ -614,7 +690,7 @@ each batch:
     - Run all 512 packets through the circuit (one at a time, sequentially)
     - Average the loss across all 512 packets
     - Compute gradients based on the average loss
-    - Update all 1,228 parameters once
+    - Update all 9,516 parameters once
 
   Batch 2 (packets 513-1024):
     - Same process with updated parameters
@@ -624,8 +700,9 @@ each batch:
     - Each batch makes the model a little better
 
 With 86,113 training samples and batch_size=512, that's 169 batches per epoch.
-At ~700 seconds per batch (measured on lightning.gpu with the triple-Pauli
-adjoint-diff circuit), one epoch takes about 33 hours.
+At ~700 seconds per batch (measured on lightning.gpu with the 60-observable
+triple-Pauli circuit), one epoch takes about 33 hours; the Z-only production
+model runs at ~17.7 hours per epoch.
 
 When all batches have been processed, that's one epoch.
 
@@ -634,7 +711,10 @@ STEP 5: Validate and check early stopping
 
 After each epoch, the model is evaluated on the test set (21,529 packets that
 were NOT used for training). The weighted F1 score measures how well the model
-classifies across all 12 OS classes.
+classifies across all 12 OS classes. Note that this same split also drives
+early stopping and best-checkpoint selection below, so it is a validation set,
+not an untouched holdout -- every metric reported on it is optimistically
+biased (see "Known Limitations" in the README).
 
 The validation loop also computes per-class F1, printing each class's individual
 score. If any class has F1 = 0.0 (the model never predicts that class), a
@@ -646,7 +726,7 @@ If F1 doesn't improve for 10 consecutive epochs (patience=10), training stops
 early -- the model has converged and further training would just waste compute.
 
 When F1 improves, the model is checkpointed:
-  - model_out.pt: PyTorch state dict (all 2,284 parameters)
+  - model_out.pt: PyTorch state dict (all trainable parameters)
   - model_out.json: config metadata (qubit count, layer count, class names,
     selected feature indices)
 
@@ -677,7 +757,8 @@ SAME circuit. The 160 rotation angles gradually shift from random to meaningful:
     - The classical head learns which measurement patterns correspond to which OS.
 
 Think of it this way: the quantum circuit learns to create a "fingerprint" of
-each packet as 20 measurement values, where packets from the same OS produce
+each packet as a vector of measurement values (60 by default, 20 for a Z-only
+model), where packets from the same OS produce
 similar fingerprints and packets from different OSes produce different fingerprints.
 The classical head then reads these fingerprints and assigns OS labels.
 
@@ -688,14 +769,15 @@ How a single packet gets classified (at prediction time)
 After training is complete, classifying a new packet works exactly like the
 forward pass described above, but with the trained weights:
 
-  1. Extract 20 selected features from the packet:
-     [1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0]
+  1. Extract 20 selected features from the packet (ternary: -1 = field absent):
+     [1, -1, 1, 0, -1, 0, 1, -1, 1, 1, -1, 1, 0, -1, 1, 1, -1, 1, 1, 0]
 
-  2. Encode into 20 qubits via RY rotations:
-     q0 -> |1>, q1 -> |0>, q2 -> |1>, ...
+  2. Encode into 20 qubits via RY((x + 1) * pi/2):
+     q0 -> |1>, q1 -> |0> (absent), q2 -> |1>, q3 -> equator (x = 0), ...
 
   3. Entangle with ring topology CNOTs:
      q0->q1, q1->q2, ..., q18->q19, q19->q0
+     (under ring_long, also the i->i+5 and i->i+10 shortcuts)
 
   4. Apply 4 variational layers with data re-uploading and TRAINED rotation angles:
      Layer 1: Re-upload features, RY(1.23) on q0, RZ(-0.45) on q0, RY(2.11) on q1, ... + ring CNOTs
@@ -703,18 +785,20 @@ forward pass described above, but with the trained weights:
      Layer 3: same pattern with layer 3's trained angles
      Layer 4: same pattern with layer 4's trained angles
 
-  5. Measure all 20 qubits on three axes (PauliZ + PauliX + PauliY):
+  5. Measure all 20 qubits (three axes in the default configuration; the
+     production model measures PauliZ only):
      PauliZ: [+0.91, -0.85, +0.73, ...]
      PauliX: [-0.33, +0.67, -0.12, ...]
      PauliY: [+0.45, -0.22, +0.88, ...]
-     -> 60 values total
+     -> 60 values total (20 for Z-only)
 
      After training, these measurements are no longer random -- they form a
      distinctive 60-dimensional pattern that the classical head recognizes as
      Windows-10. The triple measurements give the head enough signal to
      distinguish confusable variants like Windows-10 from Windows-10-Pro.
 
-  6. Classical head maps 60 measurements to class scores:
+  6. Classical head maps the measurements (plus the raw features under --skip)
+     to class scores:
      Linear(60->128) -> ReLU -> Dropout(off at prediction) -> Linear(128->12)
      [ubuntu-14.4-32b: -3.2, ..., windows-10: +5.7, ..., windows-vista: -2.8]
 
@@ -756,7 +840,7 @@ Each gate operation touches all 1M amplitudes, and the GPU processes many
 of these in parallel.
 
 For adjoint differentiation (gradient computation):
-  - Forward pass: apply all ~355 gates, the simulator tracks the evolving
+  - Forward pass: apply all ~360 gates, the simulator tracks the evolving
     state vector.
   - Backward pass: apply the conjugate transpose (adjoint) of each gate in
     reverse order, computing the gradient of the loss with respect to each
@@ -811,7 +895,8 @@ What the classical head actually does
 The classical head seems simple -- just two linear layers with a ReLU -- but it
 plays a crucial role in the architecture.
 
-The quantum circuit outputs 60 numbers in [-1, +1] (20 qubits x 3 Pauli axes).
+The quantum circuit outputs 60 numbers in [-1, +1] (20 qubits x 3 Pauli axes)
+in the default configuration, or 20 for a Z-only model.
 These 60 numbers encode the packet's identity in a way that's been shaped by the
 circuit's 160 trained angles. But 60 numbers can't directly represent 12 class
 probabilities.
@@ -870,7 +955,7 @@ The HybridQuantumNet class puts it all together:
 
   class HybridQuantumNet(nn.Module):
       quantum_layer = TorchLayer(circuit)     # 160 params
-      classical_head = Sequential(            # 8,844 params
+      classical_head = Sequential(            # 9,356 params
           Linear(60, 128), ReLU(), Dropout(0.3), Linear(128, 12)
       )
 
@@ -914,11 +999,11 @@ Comparison: step by step, same packet through both models
   XGBOOST                                    QUANTUM NEURAL NETWORK
   ──────────────────────────────────────     ──────────────────────────────────────
 
-  Input: 20 binary features                 Input: 20 binary features
-  [1,0,1,1,0,0,1,0,1,1,0,1,0,0,1,1,0,1,1,0] [1,0,1,1,0,0,1,0,1,1,0,1,0,0,1,1,0,1,1,0]
+  Input: 20 ternary features                Input: 20 ternary features
+  [1,-1,1,1,0,-1,1,-1,1,1, ...(20 total)]   [1,-1,1,1,0,-1,1,-1,1,1, ...(20 total)]
 
-  Tree 1: "Is feature 8 = 1?"               Encode: RY(pi) on qubits 0,2,3,6,8,9,
-    -> Yes -> "Is feature 3 = 1?"               11,14,15,17,18. RY(0) on the rest.
+  Tree 1: "Is feature 8 = 1?"               Encode: RY(pi) where x=1, RY(0) where
+    -> Yes -> "Is feature 3 = 1?"               x=-1 (absent), RY(pi/2) where x=0.
     -> Yes -> "Is feature 15 = 1?"
     -> Yes -> leaf: +0.4 to Windows-10         Entangle: ring CNOTs
 
@@ -932,7 +1017,7 @@ Comparison: step by step, same packet through both models
     -> Yes -> leaf: +0.15 to Windows-10
                                              Layer 4: same
   ...300 more trees...
-                                             Measure: 60 values (Z+X+Y per qubit)
+                                             Measure: 60 (Z+X+Y) or 20 (Z) values
   Sum all tree outputs:                      -> [-0.91, +0.85, -0.73, ...]
   [win10: +5.2, win7: -1.3, ubuntu: -2.1,
    macos: -3.4, ...]                         Classical head: Linear(60->128)->ReLU
@@ -942,16 +1027,16 @@ Comparison: step by step, same packet through both models
                                              Softmax -> Windows-10: 94%
 
   HOW IT LEARNED:                            HOW IT LEARNED:
-  Built trees one at a time.                 Adjusted all 9,004 params at once.
+  Built trees one at a time.                 Adjusted all 9,516 params at once.
   Each tree fits the residual errors         Each epoch, gradient descent nudges
   left by all previous trees.                every rotation angle and linear weight
   300 rounds x depth 10 = sequential         to reduce classification error.
   refinement of decision boundaries.         160 quantum angles create a learned
                                              transformation in 2^20-dimensional
-  300+ trees with ~1000 leaves each          Hilbert space. 8,844 classical weights
+  300+ trees with ~1000 leaves each          Hilbert space. 9,356 classical weights
   = hundreds of thousands of if/then         map the quantum output to class scores.
   rules learned from the data.
-                                             One circuit with 9,004 parameters
+                                             One circuit with 9,516 parameters
   Prediction: run packet through all         learns a compact representation.
   300 trees, sum their votes.
                                              Prediction: run packet through one
@@ -970,14 +1055,14 @@ XGBoost training:
 Quantum model training:
   - Each packet requires simulating a 20-qubit quantum circuit.
   - The state vector has 1,048,576 complex amplitudes.
-  - Each of ~355 gates multiplies a matrix into this million-element vector.
+  - Each of ~360 gates multiplies a matrix into this million-element vector.
   - The backward pass (adjoint differentiation) runs through all gates again
     in reverse.
   - With 86,113 training samples at 512 per batch, that's 169 batches
     per epoch. Each batch takes ~700 seconds (~11.6 minutes) on lightning.gpu
     with the triple-Pauli measurements (the PauliZ-only circuit was ~250s;
     tripling the measured observables roughly triples the adjoint-diff cost).
-  - One epoch: ~33 hours.
+  - One epoch: ~33 hours (~17.7 hours for the Z-only production model).
   - 50 epochs worst case: ~68 days.
   - With early stopping (patience=10): likely converges well before 50 epochs.
 
@@ -1022,9 +1107,10 @@ Four mechanisms address this:
      with an explicit WARNING for any class with F1=0.0. Weighted F1 can mask
      complete failure on rare classes -- per-class reporting makes this visible.
 
-  4. Feature selection (mutual_info_classif): selects features with diverse
-     information content across the TCP/IP stack, avoiding redundant correlated
-     features that can arise with variance-based methods like ANOVA F-scores.
+  4. Feature selection: both the mutual-information default and the current
+     XGBoost gain ranking pick features with diverse information content across
+     the TCP/IP stack, avoiding the redundant correlated features that
+     variance-based methods like ANOVA F-scores fall into.
 
 ---
 
@@ -1040,7 +1126,7 @@ Summary: what makes the quantum approach different
    20 measurements simultaneously).
 
 3. PARAMETER EFFICIENCY: XGBoost uses ~300,000 decision rules. The quantum
-   circuit uses 9,004 parameters. Whether fewer parameters means better
+   circuit uses 9,516 parameters. Whether fewer parameters means better
    generalization or underfitting is an empirical question.
 
 4. TRAINING: XGBoost builds trees greedily, one at a time (sequential boosting).
@@ -1058,5 +1144,16 @@ Summary: what makes the quantum approach different
    of twice as many parameters per layer.
 
 7. SPEED: XGBoost trains in minutes. The quantum model trains in days to weeks.
-   This is the cost of simulating quantum computation on classical hardware. The
-   gap would shrink dramatically on actual quantum processors.
+   This is the cost of simulating quantum computation on classical hardware.
+   Whether the gap would shrink on actual quantum processors depends on hardware
+   that does not yet exist at this qubit count and error rate.
+
+MEASURED OUTCOME (2026-08-29): on one verified protocol (identical data,
+identical 20 features, identical stratified split), the quantum model TIES
+XGBoost -- 0.3654 vs 0.3480 macro F1, 48.80% vs 49.83% accuracy at 12 classes.
+Given all 783 leak-free features, XGBoost nearly doubles the macro F1 (0.6547),
+so the binding constraint is the 20-feature bottleneck, not the classifier.
+At OS-family granularity every model scores >= 99.4%. Whether the circuit
+contributes anything beyond the classical head is still unmeasured until the
+--no-quantum --skip ablation runs. Full grid, verification trail, and
+methodology traps: docs/Benchmarks.txt.

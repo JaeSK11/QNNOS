@@ -17,14 +17,16 @@ from config.defaults import (
     DROPOUT,
     ENTANGLER,
     LEARNING_RATE,
+    MEASURE_AXES,
     N_FEATURES,
     N_LAYERS,
     N_QUBITS,
     PATIENCE,
+    SHORTCUT_OFFSETS,
     USE_BATCHNORM,
     USE_SKIP,
 )
-from data.pipeline import create_dataloaders, prepare_data
+from data.pipeline import create_dataloaders, feature_names_to_indices, prepare_data
 from evaluation.inspection import feature_importance_ranking, format_ranking
 from evaluation.metrics import full_report
 from training.hybrid_model import HybridQuantumNet
@@ -42,11 +44,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-layers", type=int, default=N_LAYERS)
     parser.add_argument("--n-features", type=int, default=N_FEATURES)
     parser.add_argument(
+        "--feature-names",
+        nargs="+",
+        default=None,
+        help="Explicit nPrint column names to use as the feature basis for a "
+        "FRESH run (bypasses SelectKBest). Count must equal --n-qubits (one "
+        "qubit per feature). Ignored on --resume (the saved basis wins). "
+        "Names in removed identifier columns are rejected.",
+    )
+    parser.add_argument(
         "--entangler",
-        choices=["cnot", "crz"],
+        choices=["cnot", "crz", "ring_long"],
         default=ENTANGLER,
-        help="Per-layer entangler: 'cnot' (fixed ring) or 'crz' (trainable). "
-        "A 'crz' model is not weight-compatible with a 'cnot' checkpoint.",
+        help="Per-layer entangler: 'cnot' (fixed ring), 'crz' (trainable ring), "
+        "or 'ring_long' (fixed ring + long-range CNOT shortcuts, see "
+        "--shortcut-offsets). Changing the entangler changes the parameterization, "
+        "so checkpoints are not cross-compatible.",
+    )
+    parser.add_argument(
+        "--measure-axes",
+        default="".join(MEASURE_AXES),
+        help="Pauli axes measured per qubit as a string, e.g. 'ZXY' (60 outputs, "
+        "default) or 'Z' (20 outputs; much cheaper with adjoint differentiation).",
+    )
+    parser.add_argument(
+        "--shortcut-offsets",
+        type=int,
+        nargs="*",
+        default=SHORTCUT_OFFSETS,
+        help="Long-range CNOT offsets for --entangler ring_long (ignored otherwise).",
     )
     parser.add_argument("--dropout", type=float, default=DROPOUT, help="Head dropout probability")
     parser.add_argument(
@@ -133,8 +159,33 @@ def main() -> None:
         args.skip = saved_config.get("use_skip", False)
         args.batchnorm = saved_config.get("use_batchnorm", False)
         args.dropout = saved_config.get("dropout", 0.3)
+        args.measure_axes = saved_config.get("measure_axes", ["Z", "X", "Y"])
+        args.shortcut_offsets = saved_config.get("shortcut_offsets", [])
         feature_indices = saved_config["feature_indices"]
         print("Resuming: reusing saved feature columns, label mapping, and architecture.", flush=True)
+    elif args.feature_names:
+        # Fresh run with an explicit feature basis (e.g. an XGBoost-ranked list):
+        # resolve names to post-removal positional indices, bypassing SelectKBest.
+        if len(args.feature_names) != args.n_qubits:
+            raise SystemExit(
+                f"--feature-names has {len(args.feature_names)} names but "
+                f"--n-qubits is {args.n_qubits}; need exactly one feature per qubit."
+            )
+        feature_indices = feature_names_to_indices(args.csv_path, args.feature_names)
+        args.n_features = len(feature_indices)
+        print(
+            f"Using {len(feature_indices)} explicit feature columns "
+            f"(SelectKBest bypassed): {args.feature_names}",
+            flush=True,
+        )
+
+    # Normalize to a list of axis letters (fresh runs pass a string like "ZXY";
+    # resume restores the saved list).
+    measure_axes = (
+        args.measure_axes if isinstance(args.measure_axes, list)
+        else [a.upper() for a in args.measure_axes]
+    )
+    shortcut_offsets = list(args.shortcut_offsets)
 
     t0 = time.time()
     print(f"Loading data from {args.csv_path}...", flush=True)
@@ -171,7 +222,9 @@ def main() -> None:
 
     print(f"Batches per epoch: {len(train_loader)} train, {len(test_loader)} test", flush=True)
     print(f"Building model: {args.n_qubits} qubits, {args.n_layers} layers, "
-          f"entangler={args.entangler}, quantum={args.quantum}, skip={args.skip}, "
+          f"entangler={args.entangler}, shortcuts={shortcut_offsets}, "
+          f"measure={''.join(measure_axes)} ({len(measure_axes) * args.n_qubits} outputs), "
+          f"quantum={args.quantum}, skip={args.skip}, "
           f"batchnorm={args.batchnorm}, dropout={args.dropout}, backend={args.backend}", flush=True)
     t1 = time.time()
     model = HybridQuantumNet(
@@ -184,6 +237,8 @@ def main() -> None:
         use_skip=args.skip,
         use_batchnorm=args.batchnorm,
         dropout=args.dropout,
+        measure_axes=measure_axes,
+        shortcut_offsets=shortcut_offsets,
     )
     build_elapsed = time.time() - t1
     q_params = (
@@ -209,6 +264,8 @@ def main() -> None:
         "use_skip": args.skip,
         "use_batchnorm": args.batchnorm,
         "dropout": args.dropout,
+        "measure_axes": measure_axes,
+        "shortcut_offsets": shortcut_offsets,
     }
 
     resume_state = None

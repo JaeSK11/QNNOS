@@ -27,9 +27,38 @@ def load_nprint(csv_path: str) -> tuple[pd.DataFrame, np.ndarray]:
 
 
 def remove_columns(features: pd.DataFrame) -> pd.DataFrame:
-    """Remove IPv4 src/dst, TCP ports, seq/ack number columns."""
+    """Drop network-identifier columns (src_ip, IPv4 src/dst/identification,
+    TCP ports, seq/ack numbers) listed in COLUMNS_TO_REMOVE."""
     cols_to_drop = [c for c in COLUMNS_TO_REMOVE if c < features.shape[1]]
     return features.drop(features.columns[cols_to_drop], axis=1)
+
+
+def feature_names_to_indices(csv_path: str, names: list[str]) -> list[int]:
+    """Map nPrint column names to positional indices in the post-column-removal
+    feature frame — the basis stored as ``feature_indices`` and consumed by
+    ``prepare_data(feature_indices=...)``.
+
+    Reuses ``remove_columns`` so the removal set stays the single source of
+    truth. Only the header is read (nrows=0), so this is cheap on large CSVs.
+    Raises with a clear message if a name is absent from the data or falls
+    inside a removed identifier column (which cannot be used as a feature).
+    """
+    header = pd.read_csv(csv_path, header=0, nrows=0)
+    features = header.iloc[:, :-1]  # drop the label column
+    kept = remove_columns(features)
+    pos = {name: i for i, name in enumerate(kept.columns)}
+    removed = set(features.columns) - set(kept.columns)
+
+    in_removed = [n for n in names if n in removed]
+    missing = [n for n in names if n not in pos and n not in removed]
+    if missing:
+        raise ValueError(f"feature names not found in {csv_path}: {missing}")
+    if in_removed:
+        raise ValueError(
+            "these feature names fall inside removed identifier columns and "
+            f"cannot be used (data leakage / dropped from the frame): {in_removed}"
+        )
+    return [pos[n] for n in names]
 
 
 def select_features(

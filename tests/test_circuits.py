@@ -60,9 +60,9 @@ def test_circuit_crz_entangler_shapes():
 
 def test_circuit_crz_angle_changes_output():
     """The CRZ entangler angle (the 3rd param) affects the output once qubits
-    are in superposition. (With zero RY the state stays a basis state and CRZ,
-    being diagonal, only adds an unobservable phase — the same reason the
-    encoding CNOT ring creates no entanglement on basis states.)"""
+    are in superposition. (Under the ternary encoding, 0-valued inputs already
+    sit on the equator, but we also set non-zero RY so every qubit is in
+    superposition regardless of its input value.)"""
     circuit, _ = create_circuit(
         n_qubits=4, n_layers=1, backend="default.qubit", entangler="crz"
     )
@@ -82,8 +82,8 @@ def test_invalid_entangler_raises():
         create_circuit(n_qubits=4, n_layers=1, backend="default.qubit", entangler="bogus")
 
 
-def test_circuit_binary_encoding():
-    """Verify that all-zero input produces different output than all-one input."""
+def test_circuit_encoding_distinguishes_zero_from_one():
+    """All-zero input (equator) must produce different output than all-one input (|1>)."""
     circuit, _ = create_circuit(n_qubits=4, n_layers=1, backend="default.qubit")
 
     weights = torch.zeros(1, 4, 2, dtype=torch.float64)
@@ -93,3 +93,24 @@ def test_circuit_binary_encoding():
     r_zeros = [float(v) for v in circuit(zeros, weights)]
     r_ones = [float(v) for v in circuit(ones, weights)]
     assert r_zeros != r_ones
+
+
+def test_circuit_ternary_encoding_distinguishes_absent_from_set():
+    """Regression test: -1 ("field absent") must NOT alias with +1 ("bit set").
+
+    The old RY(x * pi) encoding mapped -1 and +1 to the same state up to
+    global phase (RY(-pi) = -RY(pi)), making them indistinguishable by any
+    measurement — even with data re-uploading, since the scalar factors out
+    of the whole circuit. The ternary encoding RY((x + 1) * pi/2) maps
+    -1/0/+1 to three distinct Bloch latitudes.
+    """
+    circuit, _ = create_circuit(n_qubits=4, n_layers=2, backend="default.qubit")
+
+    torch.manual_seed(7)
+    weights = torch.rand(2, 4, 2, dtype=torch.float64) * 2 * torch.pi
+    x_absent = torch.tensor([-1.0, 0.0, -1.0, 1.0], dtype=torch.float64)
+    x_set = torch.tensor([1.0, 0.0, 1.0, 1.0], dtype=torch.float64)
+
+    r_absent = torch.stack(circuit(x_absent, weights))
+    r_set = torch.stack(circuit(x_set, weights))
+    assert (r_absent - r_set).abs().max() > 1e-3

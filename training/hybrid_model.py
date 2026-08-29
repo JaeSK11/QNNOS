@@ -9,8 +9,10 @@ from config.defaults import (
     DEFAULT_BACKEND,
     DROPOUT,
     ENTANGLER,
+    MEASURE_AXES,
     N_LAYERS,
     N_QUBITS,
+    SHORTCUT_OFFSETS,
     USE_BATCHNORM,
     USE_SKIP,
 )
@@ -20,7 +22,8 @@ class HybridQuantumNet(nn.Module):
     """Variational quantum classifier with classical post-processing head.
 
     Head input is the concatenation of, optionally:
-      - the quantum layer's 3*n_qubits Pauli expvals (when use_quantum),
+      - the quantum layer's len(measure_axes)*n_qubits Pauli expvals (when
+        use_quantum; 60 for the default Z+X+Y on 20 qubits),
       - the raw n_qubits input features (when use_skip; a residual path so the
         head can use the data the circuit maps poorly, and provably >= a
         classical MLP on the raw features).
@@ -42,6 +45,8 @@ class HybridQuantumNet(nn.Module):
         use_skip: bool = USE_SKIP,
         use_batchnorm: bool = USE_BATCHNORM,
         dropout: float = DROPOUT,
+        measure_axes: list[str] | None = None,
+        shortcut_offsets: list[int] | None = None,
     ):
         super().__init__()
         self.n_qubits = n_qubits
@@ -50,11 +55,19 @@ class HybridQuantumNet(nn.Module):
         self.entangler = entangler
         self.use_quantum = use_quantum
         self.use_skip = use_skip
+        self.measure_axes = list(measure_axes) if measure_axes is not None else list(MEASURE_AXES)
+        self.shortcut_offsets = (
+            list(shortcut_offsets) if shortcut_offsets is not None else list(SHORTCUT_OFFSETS)
+        )
 
         if use_quantum:
-            circuit, weight_shapes = create_circuit(n_qubits, n_layers, backend, entangler)
+            circuit, weight_shapes = create_circuit(
+                n_qubits, n_layers, backend, entangler,
+                measure_axes=self.measure_axes, shortcut_offsets=self.shortcut_offsets,
+            )
             self.quantum_layer = qml.qnn.TorchLayer(circuit, weight_shapes)
-            q_out_dim = 3 * n_qubits  # PauliZ + PauliX + PauliY measurements
+            # One expval per measured Pauli axis per qubit.
+            q_out_dim = len(self.measure_axes) * n_qubits
         else:
             self.quantum_layer = None
             q_out_dim = 0

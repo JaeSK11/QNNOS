@@ -1,4 +1,4 @@
-.PHONY: train test docker-build docker-run clean
+.PHONY: train test eval-heldout inspect unit-test docker-build docker-run clean
 
 BACKEND ?= lightning.gpu
 DATA ?= data/nprint.csv
@@ -9,6 +9,12 @@ train:
 
 test:
 	python scripts/test.py $(DATA) models/$(MODEL) --backend $(BACKEND)
+
+eval-heldout:
+	python scripts/eval_heldout.py $(DATA) models/$(MODEL) --backend $(BACKEND)
+
+inspect:
+	python scripts/inspect_model.py $(DATA) models/$(MODEL) --backend $(BACKEND)
 
 unit-test:
 	pytest tests/ -v

@@ -9,9 +9,10 @@ services:
     restart: unless-stopped
     # Give the trainer's SIGTERM handler time to flush a resume checkpoint on a
     # graceful stop. Best-effort: a signal arriving mid-batch isn't handled
-    # until that ~700s batch ends, so the periodic mid-epoch checkpoint (every
-    # 50 batches) is the real durability guarantee. 120s covers a between-batch
-    # catch + the ~40MB checkpoint write without unduly delaying host shutdowns.
+    # until the current batch ends (minutes under adjoint differentiation), so
+    # the periodic mid-epoch checkpoint (every 50 batches) is the real
+    # durability guarantee. 120s covers a between-batch catch + the sub-MB
+    # checkpoint write without unduly delaying host shutdowns.
     stop_grace_period: 120s
     deploy:
       resources:
@@ -30,4 +31,20 @@ services:
     # inspect_model.py to stop it shadowing the stdlib `inspect` module, which
     # made newer numpy/pandas crash on import; `-m` is kept as belt-and-suspenders
     # against any future same-name collision.)
-    command: python -m scripts.train data/Monday-WorkingHours_50th.csv model_out --backend lightning.gpu --skip --batchnorm --dropout 0.1 --resume
+    #
+    # Default run: the current best configuration on data/nprint.csv (see the
+    # README "Dataset" section). --entangler ring_long adds long-range CNOT
+    # shortcuts (offsets 5,10) so distant qubits can interact within a layer;
+    # --measure-axes Z drops to 20 observables (from Z+X+Y = 60), which under
+    # adjoint differentiation cuts epoch time roughly in half (~14h/epoch on an
+    # RTX 3090 for ~86K training rows; see docs/DECISIONS.txt, Decision 8).
+    # --resume makes every auto-restart continue the run; on the very first
+    # launch (no checkpoint yet) it is a no-op and the run starts fresh.
+    command: python -m scripts.train data/nprint.csv model_out --backend lightning.gpu --entangler ring_long --measure-axes Z --shortcut-offsets 5 10 --skip --batchnorm --dropout 0.1 --resume
+    #
+    # Reproduction of the checkpoint scored in docs/Benchmarks.txt
+    # (models/model_xgb20): same flags, but with an explicit feature basis —
+    # the top-20 columns by gain from an XGBoost classifier fit on the same
+    # data with identifier columns removed — instead of SelectKBest. Put
+    # --feature-names last so its nargs list is unambiguous:
+    #   command: python -m scripts.train data/nprint.csv model_xgb20 --backend lightning.gpu --entangler ring_long --measure-axes Z --shortcut-offsets 5 10 --skip --batchnorm --dropout 0.1 --resume --feature-names tcp_opt_104 ipv4_ttl_1 tcp_opt_40 tcp_opt_96 ipv4_ttl_0 tcp_opt_20 tcp_wsize_2 ipv4_tos_4 tcp_wsize_0 tcp_opt_21 tcp_wsize_1 tcp_opt_28 tcp_opt_34 tcp_wsize_5 ipv4_dfbit_0 tcp_ackf_0 tcp_opt_36 tcp_syn_0 tcp_rst_0 tcp_opt_7

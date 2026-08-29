@@ -5,9 +5,11 @@ Two things you can look at that are otherwise invisible:
   1. Feature-importance ranking -- which of the selected features carry the most
      signal, by mutual information with the label.
   2. Data snapshots at the two interesting boundaries:
-       - PRE-circuit:  the processed binary feature vector that enters the QNode.
-       - POST-circuit: the 60 Pauli expectation values that leave the QNode and
-                       enter the classical head.
+       - PRE-circuit:  the processed ternary feature vector (-1/0/1, one value
+                       per qubit) that enters the QNode.
+       - POST-circuit: the Pauli expectation values (one per measured axis per
+                       qubit; 60 for the default Z+X+Y on 20 qubits) that leave
+                       the QNode and enter the classical head.
 """
 
 from functools import partial
@@ -39,8 +41,8 @@ def compute_mi_ranking(X, y, feature_indices: list[int], random_state: int = 42)
     feature_indices[j]. Self-contained: does not depend on scores persisted at
     train time, so it works for any checkpoint.
 
-    Uses discrete_features=True because nPrint features are binary -- this is the
-    exact contingency-table MI estimator (deterministic, robust for small
+    Uses discrete_features=True because nPrint features are discrete (ternary
+    -1/0/1) -- this is the exact contingency-table MI estimator (deterministic, robust for small
     samples), which differs slightly from the pipeline's continuous kNN
     estimator used during feature *selection*.
     """
@@ -69,7 +71,7 @@ def _label_of(y_i, label_classes):
 
 
 def pre_circuit_snapshot(X, y, feature_indices, label_classes=None, n_samples=5) -> list[dict]:
-    """The processed feature vectors that enter the circuit (binary, one per qubit)."""
+    """The processed feature vectors that enter the circuit (ternary -1/0/1, one per qubit)."""
     X = np.asarray(X)
     n = min(n_samples, X.shape[0])
     out = []
@@ -85,28 +87,28 @@ def pre_circuit_snapshot(X, y, feature_indices, label_classes=None, n_samples=5)
 
 
 def post_circuit_snapshot(model, X, y, label_classes=None, n_samples=5):
-    """The 60 quantum expectation values that leave the circuit and enter the head.
+    """The quantum expectation values that leave the circuit and enter the head.
 
     Returns None if the model has no quantum layer (--no-quantum baseline).
-    Output ordering matches the circuit: [Z0..Z(nq-1), X0.., Y0..].
+    Output ordering matches the circuit: grouped by measured axis, then qubit
+    (e.g. [Z0..Z(nq-1), X0.., Y0..] for the default Z+X+Y). Each entry carries
+    one key per measured axis ("Z", "X", "Y") plus the flat "vector".
     """
     if getattr(model, "quantum_layer", None) is None:
         return None
     X = torch.as_tensor(np.asarray(X), dtype=torch.float32)
     n = min(n_samples, X.shape[0])
     nq = model.n_qubits
+    axes = list(getattr(model, "measure_axes", ["Z", "X", "Y"]))
     model.eval()
     with torch.no_grad():
         expvals = model.quantum_layer(X[:n]).cpu().numpy()
     out = []
     for i in range(n):
         row = [float(v) for v in expvals[i]]
-        out.append({
-            "sample": i,
-            "label": _label_of(y[i], label_classes),
-            "Z": row[0:nq],
-            "X": row[nq:2 * nq],
-            "Y": row[2 * nq:3 * nq],
-            "vector": row,
-        })
+        entry = {"sample": i, "label": _label_of(y[i], label_classes)}
+        for j, ax in enumerate(axes):
+            entry[ax] = row[j * nq:(j + 1) * nq]
+        entry["vector"] = row
+        out.append(entry)
     return out

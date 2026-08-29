@@ -4,27 +4,28 @@
   "n_features": 20,
   "n_classes": 12,
   "feature_indices": [
-    48,
+    567,
     49,
-    399,
-    400,
-    402,
-    483,
-    484,
-    486,
-    497,
-    499,
-    500,
-    502,
     503,
-    504,
-    505,
-    506,
-    507,
-    508,
-    530,
-    531
+    559,
+    48,
+    483,
+    417,
+    12,
+    415,
+    484,
+    416,
+    491,
+    497,
+    420,
+    33,
+    410,
+    499,
+    413,
+    412,
+    470
   ],
+  "feature_scores": null,
   "label_classes": [
     "mac_mac-os-x",
     "ubuntu-14.4-32b",
@@ -39,5 +40,17 @@
     "windows-8.1",
     "windows-vista"
   ],
-  "backend": "lightning.gpu"
+  "backend": "lightning.gpu",
+  "entangler": "ring_long",
+  "use_quantum": true,
+  "use_skip": true,
+  "use_batchnorm": true,
+  "dropout": 0.1,
+  "measure_axes": [
+    "Z"
+  ],
+  "shortcut_offsets": [
+    5,
+    10
+  ]
 }

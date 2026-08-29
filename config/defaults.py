@@ -4,11 +4,30 @@ N_LAYERS = 4
 N_FEATURES = 20
 
 # Per-layer entangler:
-#   "cnot" - fixed CNOT ring (no trainable parameters, 2 params/qubit/layer)
-#   "crz"  - trainable controlled-RZ ring; entanglement strength is learned
-#            (3 params/qubit/layer). Changes weight_shapes, so a "crz" model
-#            is NOT weight-compatible with a "cnot" checkpoint.
+#   "cnot"      - fixed CNOT ring (no trainable parameters, 2 params/qubit/layer)
+#   "crz"       - trainable controlled-RZ ring; entanglement strength is learned
+#                 (3 params/qubit/layer). Changes weight_shapes, so a "crz" model
+#                 is NOT weight-compatible with a "cnot" checkpoint.
+#   "ring_long" - fixed CNOT ring PLUS long-range CNOT shortcuts at SHORTCUT_OFFSETS
+#                 (2 params/qubit/layer, same weight_shapes as "cnot"). Adds
+#                 reachability so distant feature-bits can interact within a layer
+#                 — a trainable-budget-friendly stand-in for all-to-all, whose
+#                 190-pair adjoint cost (~5 days/epoch) is impractical here.
 ENTANGLER = "cnot"
+
+# Long-range shortcuts for ENTANGLER == "ring_long": in addition to the
+# nearest-neighbor ring, add a fixed CNOT between qubits i and (i+k) % N_QUBITS
+# for each offset k, every layer. Chosen to shrink the ring's graph diameter
+# (offset 10 = antipodal on 20 qubits; offset 5 = quarter-way) so any two qubits
+# can correlate in a few layers instead of propagating around the ring.
+SHORTCUT_OFFSETS = [5, 10]
+
+# Pauli axes measured per qubit; circuit output = len(MEASURE_AXES) * N_QUBITS
+# expvals. ["Z","X","Y"] = full Bloch vector (60 outputs, the original model).
+# ["Z"] = 20 outputs — far cheaper under adjoint differentiation, whose cost
+# scales with the number of measured observables (see docs/DECISIONS.txt,
+# Decision 8, for the measured per-sample timings).
+MEASURE_AXES = ["Z", "X", "Y"]
 
 # Training
 BATCH_SIZE = 512
