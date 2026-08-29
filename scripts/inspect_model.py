@@ -3,8 +3,8 @@
 
 Produces three artifacts for a handful of samples:
   1. Feature-importance ranking (mutual information) of the model's features.
-  2. PRE-circuit snapshot  -- the processed binary vectors entering the QNode.
-  3. POST-circuit snapshot -- the 60 Pauli expvals entering the classical head.
+  2. PRE-circuit snapshot  -- the processed ternary vectors entering the QNode.
+  3. POST-circuit snapshot -- the Pauli expvals entering the classical head.
 
 Writes <model_name>_inspection.{json,txt} next to the model and prints a summary.
 """
@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
 
 def _fmt_row(vals, width=6):
     return " ".join(f"{v:>{width}.3f}" for v in vals)
+
+
+def _fmt_inputs(vals):
+    # Ternary inputs (-1 = field absent, 0, 1), right-aligned to two columns.
+    return " ".join(f"{int(v):>2}" for v in vals)
 
 
 def main() -> None:
@@ -82,21 +87,23 @@ def main() -> None:
     print(format_ranking(ranking, top=args.top))
 
     print(f"\n=== PRE-CIRCUIT SNAPSHOT ({len(pre)} samples, {len(feature_indices)} features) ===")
-    print("Processed binary features fed to the QNode (RY(feature * pi) per qubit):")
+    print("Ternary features fed to the QNode, encoded as RY((x + 1) * pi/2) per qubit")
+    print("(-1 = field absent -> |0>, 0 -> equator, 1 -> |1>):")
     for s in pre:
-        bits = "".join(str(int(v)) for v in s["vector"])
-        print(f"  sample {s['sample']} [{s['label']}]: {bits}")
+        print(f"  sample {s['sample']} [{s['label']}]: {_fmt_inputs(s['vector'])}")
 
-    print(f"\n=== POST-CIRCUIT SNAPSHOT ({args.n_samples} samples) ===")
+    axes = list(model.measure_axes) if post is not None else []
+    n_expvals = len(axes) * model.n_qubits
+    print(f"\n=== POST-CIRCUIT SNAPSHOT ({len(pre)} samples) ===")
     if post is None:
         print("  (model has no quantum layer -- --no-quantum baseline; nothing to show)")
     else:
-        print("60 Pauli expectation values in [-1, 1] entering the classical head:")
+        print(f"{n_expvals} Pauli expectation values ({''.join(axes)} per qubit) in [-1, 1] "
+              "entering the classical head:")
         for s in post:
             print(f"  sample {s['sample']} [{s['label']}]")
-            print(f"    Z: {_fmt_row(s['Z'])}")
-            print(f"    X: {_fmt_row(s['X'])}")
-            print(f"    Y: {_fmt_row(s['Y'])}")
+            for ax in axes:
+                print(f"    {ax}: {_fmt_row(s[ax])}")
 
     # ---- Persist artifacts ----
     payload = {
@@ -105,6 +112,7 @@ def main() -> None:
         "feature_importance_source": importance_source,
         "feature_importance": ranking,
         "pre_circuit": pre,
+        "measure_axes": axes,
         "post_circuit": post,  # None for classical baseline
         "has_quantum": post is not None,
     }
@@ -117,19 +125,17 @@ def main() -> None:
         f.write(f"Inspection of {model_dir}/{model_name} on {args.csv_path}\n\n")
         f.write("FEATURE IMPORTANCE (mutual information)\n")
         f.write(format_ranking(ranking) + "\n\n")
-        f.write("PRE-CIRCUIT (processed features entering the QNode)\n")
+        f.write("PRE-CIRCUIT (ternary features entering the QNode; -1 = field absent)\n")
         for s in pre:
-            bits = "".join(str(int(v)) for v in s["vector"])
-            f.write(f"  sample {s['sample']} [{s['label']}]: {bits}\n")
-        f.write("\nPOST-CIRCUIT (60 expvals entering the classical head)\n")
+            f.write(f"  sample {s['sample']} [{s['label']}]: {_fmt_inputs(s['vector'])}\n")
+        f.write(f"\nPOST-CIRCUIT ({n_expvals} expvals entering the classical head)\n")
         if post is None:
             f.write("  (no quantum layer)\n")
         else:
             for s in post:
                 f.write(f"  sample {s['sample']} [{s['label']}]\n")
-                f.write(f"    Z: {_fmt_row(s['Z'])}\n")
-                f.write(f"    X: {_fmt_row(s['X'])}\n")
-                f.write(f"    Y: {_fmt_row(s['Y'])}\n")
+                for ax in axes:
+                    f.write(f"    {ax}: {_fmt_row(s[ax])}\n")
 
     print(f"\nSaved: {json_path}\n       {txt_path}")
 

@@ -70,6 +70,21 @@ def test_post_circuit_snapshot_shapes():
         assert all(-1.0 <= v <= 1.0 for v in s["vector"])
 
 
+def test_post_circuit_snapshot_single_axis():
+    """A Z-only model yields one 'Z' block per sample and no X/Y keys."""
+    model = HybridQuantumNet(
+        n_classes=3, n_qubits=4, n_layers=1, backend="default.qubit", measure_axes=["Z"],
+    )
+    X = torch.tensor([[-1.0, 0.0, 1.0, 0.0], [1.0, 1.0, -1.0, 0.0]])
+    y = torch.tensor([0, 1])
+    snap = post_circuit_snapshot(model, X, y, ["a", "b", "c"], n_samples=2)
+    assert len(snap) == 2
+    for s in snap:
+        assert len(s["Z"]) == 4 and len(s["vector"]) == 4
+        assert "X" not in s and "Y" not in s
+        assert all(-1.0 <= v <= 1.0 for v in s["vector"])
+
+
 def test_post_circuit_snapshot_none_without_quantum():
     model = HybridQuantumNet(
         n_classes=3, n_qubits=4, n_layers=1, backend="default.qubit",

@@ -1,0 +1,135 @@
+================================================================================
+QuantumNeuralNetworkOS -- Benchmark Comparison vs Classical Baselines
+================================================================================
+
+Date: 2026-08-29
+Context: model_xgb20 (epoch-3 best checkpoint, trained 2026-07-27..08-04) scored
+         against XGBoost baselines from OsirisML (a separate, unpublished
+         XGBoost project on the same data; not part of this repository). Earlier cross-repo comparisons
+         mixed splits and F1 averaging conventions; this document is the
+         corrected, verified, single-split comparison. Every number below was
+         independently reproduced on 2026-08-29 (XGBoost refits matched prior
+         claims to 4 decimal places).
+
+--------------------------------------------------------------------------------
+PROTOCOL (identical for all models)
+--------------------------------------------------------------------------------
+
+Dataset:   Monday-WorkingHours_50th.csv, 107,642 rows, 12 OS-version labels.
+           QNN and OsirisML copies are byte-identical
+           (md5 dbee6dd35dee3f9927bdf583281e87a1).
+Basis:     OsirisML identifier-column removal (src_ip col 0, IPv4 src/dst/id,
+           TCP ports, seq/ack) -> 783 leak-free feature columns. Removal index
+           sets verified identical in both repos.
+Split:     stratified 20% held out, random_state=42 -> 21,529 eval samples.
+           All models below use THIS split (see "Split gotcha").
+Models:    - QNN model_xgb20: 20 qubits, ring_long entangler (offsets 5,10),
+             Z-only measurement, skip+batchnorm+dropout 0.1, ternary inputs;
+             epoch-3 checkpoint (best of 10 epochs by val F1).
+           - XGBoost same-20: XGBClassifier(max_depth=10), raw values of the
+             identical 20 features (leak-free gain-ranked top-20; the QNN's
+             stored feature_indices resolve to exactly this list, in order).
+           - XGBoost all-783: same hyperparams, all leak-free columns
+             ("classical unconstrained" reference).
+Views:     the same predictions scored at three label granularities.
+
+--------------------------------------------------------------------------------
+RESULTS (accuracy / macro F1 / weighted F1)
+--------------------------------------------------------------------------------
+
+model                        view                          acc   f1_mac  f1_wgt
+QNN model_xgb20 (epoch 3)    12-class                    0.4880  0.3654  0.4122
+QNN model_xgb20 (epoch 3)    11-class (win10 merged)     0.6547  0.4135  0.6601
+QNN model_xgb20 (epoch 3)    3-family                    0.9941  0.9861  0.9941
+
+XGBoost same-20 features     12-class                    0.4983  0.3480  0.4074
+XGBoost same-20 features     11-class (win10 merged)     0.6662  0.3938  0.6547
+XGBoost same-20 features     3-family                    0.9945  0.9872  0.9945
+
+XGBoost all-783 features     12-class                    0.6383  0.6547  0.6339
+XGBoost all-783 features     11-class (win10 merged)     0.7946  0.6905  0.7938
+XGBoost all-783 features     3-family                    0.9959  0.9903  0.9959
+
+11-class = windows-10 + windows-10-pro merged (the observed indistinguishable
+pair). 3-family = mac / ubuntu / windows.
+
+--------------------------------------------------------------------------------
+CONCLUSIONS
+--------------------------------------------------------------------------------
+
+1. The QNN TIES the feature-matched classical baseline. At 12 classes:
+   +0.017 macro F1, -1.0pt accuracy vs XGBoost on the same 20 features. The
+   QNN's only consistent edge is macro F1 (+0.017 at 12-class, +0.020 at
+   11-class), i.e. slightly more balanced minority-class behavior -- plausibly
+   an artifact of its class-weighted FocalLoss rather than the circuit
+   (XGBoost was trained unweighted).
+
+2. The family-level result is NOT a QNN differentiator. All three models
+   sit at 99.4-99.6% on 3-family; XGBoost-20 (99.45%) actually edges the QNN
+   (99.41%). The mac/ubuntu/windows boundary is simply easy given these
+   features. Claim it as a property of the feature basis, not the circuit.
+
+3. The 20-feature bottleneck, not the classifier, is the binding constraint.
+   Unconstrained 783-feature XGBoost roughly doubles 12-class macro F1
+   (0.6547 vs 0.3654) and reaches 0.6905 at 11-class. Most version-level
+   signal lies outside the top-20 features.
+
+4. No quantum-advantage claim is supported. The hybrid model also contains a
+   classical MLP head fed by raw features (--skip); the circuit's marginal
+   contribution is unmeasured until the built-in ablation is run
+   (--no-quantum --skip = identical head, features, loss, no circuit).
+
+Defensible summary sentence: "A 20-qubit hybrid variational classifier ties a
+feature-matched XGBoost on identical data and split (0.365 vs 0.348 macro F1,
+48.8% vs 49.8% accuracy at 12 classes)."
+
+--------------------------------------------------------------------------------
+METHODOLOGY TRAPS (verified, they bit us)
+--------------------------------------------------------------------------------
+
+Split gotcha: OsirisML scripts call train_test_split(random_state=42) WITHOUT
+stratify; the QNN pipeline stratifies. Same seed -> completely different
+partition: measured test-set overlap 4,305/21,529 = 20.0%, exactly chance.
+Cross-repo numbers are not comparable unless re-run on one split.
+(Stratification itself moves XGBoost-783 by only ~0.5pt: 63.36% -> 63.83%.)
+
+F1 averaging: the QNN trainer's logged "Val_F1" is WEIGHTED F1 (0.4122),
+while OsirisML logs MACRO F1. Early comparisons mixed the two. Always state
+the average. Superseded numbers: "49.4% / 0.339" for XGBoost-20 came from an
+unstratified split; use 49.83% / 0.3480.
+
+Selection bias: the QNN number is its best-of-10-epochs checkpoint selected on
+this same split (which doubled as the val set; no untouched holdout exists).
+The XGBoost fits had no tuning on the split, so if anything the protocol
+favors the QNN.
+
+Input encoding: XGBoost sees raw feature values; the QNN sees ternarized
+(-1/0/1) inputs. Feature-matched, not information-matched.
+
+--------------------------------------------------------------------------------
+REPRODUCTION
+--------------------------------------------------------------------------------
+
+QNN held-out eval (reproduces the stratified seed-42 split and scores the
+12-class, win10-merged, and 3-family views from the same predictions; writes
+models/model_xgb20_heldout.txt + models/model_xgb20_heldout_preds.npz):
+  python scripts/eval_heldout.py data/Monday-WorkingHours_50th.csv models/model_xgb20 \
+      --backend lightning.gpu --merge windows-10,windows-10-pro
+
+XGBoost rows: XGBClassifier(max_depth=10) refit on the identical stratified
+split with the OsirisML baseline's hyperparameters. That baseline and its
+comparison script are a separate project and are not part of this repository.
+The checkpoint scored above is models/model_xgb20 (.pt + .json).
+
+--------------------------------------------------------------------------------
+OPEN ITEMS
+--------------------------------------------------------------------------------
+
+1. Run the classical ablation: --no-quantum --skip (same head/features/loss,
+   no circuit). Decides whether the circuit contributes anything at 12 classes.
+2. Retrain XGBoost-20 with class weights for a loss-matched macro-F1
+   comparison.
+3. Multiple seeds on any comparison that ends up in a writeup; the 0.017
+   macro gap is likely within run-to-run noise.
+4. If pursuing version-level accuracy, widen the feature basis (more qubits or
+   classical-side features) before more circuit variants.

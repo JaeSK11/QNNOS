@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""CLI entrypoint: evaluate a saved variational quantum classifier."""
+"""CLI entrypoint: evaluate a saved variational quantum classifier.
+
+Scores EVERY row of the given CSV, so point it at data the model has not seen.
+If you pass the CSV the model was trained on, ~80% of the rows were training
+data and the numbers are contaminated; use scripts/eval_heldout.py instead,
+which reproduces the training split and scores only the held-out 20%.
+"""
 
 import argparse
 import sys

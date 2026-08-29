@@ -68,10 +68,11 @@ class FocalLoss(nn.Module):
 EPOCH_LOG_FILE = "training_log.txt"
 PROGRESS_INTERVAL = 10  # write progress every N batches
 LOG_GRAD_INTERVAL = 50  # log gradient norms every N batches
-# Persist full resume state mid-epoch every N batches. Epochs can run for days
-# on the large dataset; without this a hard kill (SIGKILL/OOM/power loss) would
-# discard the whole in-flight epoch. The .resume.pt write is ~40 MB, cheap
-# relative to a ~700s batch.
+# Persist full resume state mid-epoch every N batches. Epochs can run for many
+# hours (days on the full dataset); without this a hard kill (SIGKILL/OOM/power
+# loss) would discard the whole in-flight epoch. The .resume.pt file is small
+# (well under 1 MB for the 20-qubit model), so the write is negligible next to
+# a single batch, which takes minutes under adjoint differentiation.
 RESUME_CHECKPOINT_INTERVAL = 50
 
 # Markers appended to EPOCH_LOG_FILE so the *next* run can tell how the previous
@@ -220,6 +221,10 @@ def load_checkpoint(
         use_skip=config.get("use_skip", False),
         use_batchnorm=config.get("use_batchnorm", False),
         dropout=config.get("dropout", 0.3),
+        # Default to the original 60-observable full-Bloch config so pre-existing
+        # checkpoints (which omit these keys) rebuild to the identical model.
+        measure_axes=config.get("measure_axes", ["Z", "X", "Y"]),
+        shortcut_offsets=config.get("shortcut_offsets", []),
     )
     weights_path = os.path.join(save_dir, f"{name}.pt")
     model.load_state_dict(torch.load(weights_path, weights_only=True))
@@ -335,9 +340,9 @@ def train_model(
 
     def _handle_shutdown(signum, _frame):
         # Reached only at a Python bytecode boundary, i.e. BETWEEN batches. A
-        # signal arriving mid-batch waits for that ~700s batch to finish, so
-        # Docker's stop_grace_period must exceed one batch for this to fire
-        # before SIGKILL. The periodic mid-epoch checkpoint is the guaranteed
+        # signal arriving mid-batch waits for the current batch (minutes under
+        # adjoint differentiation) to finish, so Docker's stop_grace_period
+        # must exceed one batch for this to fire before SIGKILL. The periodic mid-epoch checkpoint is the guaranteed
         # durability path; this handler is best-effort forensics + a final save.
         name = signal.Signals(signum).name
         msg = (f"=== RUN SHUTDOWN {time.strftime('%Y-%m-%d %H:%M:%S')}: caught "

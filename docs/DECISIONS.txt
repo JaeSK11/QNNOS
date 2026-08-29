@@ -103,7 +103,7 @@ Before:
 
 After:
   Linear(60, 128) -> ReLU -> Dropout(0.3) -> Linear(128, 12)
-  Parameters: 8,844
+  Parameters: 9,356 (7,808 + 1,548)
 
 Why:
   The old head had to separate 12 classes (including 5 confusable Windows
@@ -121,7 +121,8 @@ What we considered but rejected:
   - Even larger heads (256+ neurons): Diminishing returns. The bottleneck is
     still the quantum feature quality, not classical capacity.
   - Batch normalization: Adds complexity; dropout alone should suffice given
-    the binary nature of the input features.
+    the binary nature of the input features. (Superseded: the inputs are
+    ternary, Decision 6, and --batchnorm is on in the production model.)
 
 --------------------------------------------------------------------------------
 DECISION 4: Focal Loss (was Weighted CrossEntropyLoss)
@@ -237,12 +238,75 @@ Total additional compute per batch: ~0%
   - Focal loss: same forward/backward cost
   - ANOVA feature selection: one-time cost before training
 
-Model parameters: 2,284 -> 9,004
+Model parameters: 2,284 -> 9,516
   - Quantum: 160 (unchanged)
-  - Classical: 2,124 -> 8,844
+  - Classical: 2,124 -> 9,356
 
 Requires full retrain from scratch (new features, new architecture).
 Current run has plateaued and should be stopped.
+
+================================================================================
+Date: 2026-07-15
+Context: Slide-prep inspection of real feature vectors revealed that the
+         selected features are NOT binary: nPrint emits -1 for "field absent",
+         and 58% of all values across the 20 selected features are -1
+         (31.2M of 53.9M), vs 26% zeros and 16% ones. 18 of the 20 selected
+         features are TCP options bits, absent in every packet without options.
+
+--------------------------------------------------------------------------------
+DECISION 6: Ternary-Aware Encoding RY((x+1) * pi/2)  (was RY(x * pi))
+--------------------------------------------------------------------------------
+
+File changed: circuits/model.py (both AngleEmbedding calls: initial encoding
+and the per-layer data re-uploading)
+
+Before:
+  qml.AngleEmbedding(inputs * np.pi, rotation="Y")
+  Mapping: 0 -> RY(0) = |0>,  1 -> RY(pi) = |1>,  -1 -> RY(-pi) = -|1>
+
+After:
+  qml.AngleEmbedding((inputs + 1) * (np.pi / 2), rotation="Y")
+  Mapping: -1 -> RY(0) = |0>,  0 -> RY(pi/2) = equator,  1 -> RY(pi) = |1>
+
+Why (the bug):
+  RY(-pi) = -RY(pi) as operators — they differ only by a scalar -1, i.e. a
+  global phase. So under the old encoding, "field absent" (-1) and "bit set"
+  (+1) entered the circuit as PHYSICALLY IDENTICAL states. No downstream gate
+  or measurement can recover the difference. Crucially, data re-uploading does
+  NOT rescue this: the re-uploaded RY(x*pi) hits an entangled state, but the
+  scalar still factors out of the whole state, layer after layer.
+
+  Verified numerically on the real circuit (20 qubits, 4 layers, cnot
+  entangler): flipping 7 features from -1 to +1 changed all 60 expectation
+  values by at most 6e-8 (float noise). Regression test added:
+  tests/test_circuits.py::test_circuit_ternary_encoding_distinguishes_absent_from_set
+
+  Consequence of the bug: the quantum circuit only ever saw {0} vs {1,-1} —
+  a lossy binarization where "TCP option bit set" and "no TCP options at all"
+  were the same value. With --skip enabled, the raw features (including -1s)
+  bypass the circuit into the classical head, so any absent-vs-set signal was
+  being learned entirely classically.
+
+Why this fix (vs alternatives):
+  - Remapping -1 -> 0 in the pipeline: simplest, but merely chooses a
+    different collision (absent aliases with 0 instead of with 1).
+  - Presence qubits (one per field): doubles qubit count; infeasible at the
+    24 GB VRAM ceiling.
+  - The affine map keeps one qubit per feature, costs zero extra gates or
+    parameters, and gives all three values distinct Bloch latitudes.
+
+Side effects to be aware of:
+  1. The post-encoding state is no longer a computational basis state
+     (0-valued features sit on the equator), so the FIRST CNOT ring now
+     genuinely entangles. The old "the first ring is just classical XOR"
+     description no longer holds. This also means the "crz" entangler now has
+     something to bite on from layer 0.
+  2. NOT weight-compatible in spirit with checkpoints trained under the old
+     encoding: shapes are unchanged, but the input-to-state mapping differs,
+     so resuming an old run under the new encoding mixes two incompatible
+     regimes. Requires a fresh training run (archive the old model_out).
+  3. Encoding now uses 3 points per qubit instead of 2, which also softens
+     the "binary features use only 2 Bloch points" limitation.
 
 --------------------------------------------------------------------------------
 PREVIOUS MODEL PERFORMANCE (baseline for comparison)
@@ -265,3 +329,244 @@ Best results after 26 epochs (~2 weeks training):
       9 (windows-7-pro): 0.05  <-- target
      10 (windows-8.1):   0.27
      11 (windows-vista):  0.01  <-- target
+
+================================================================================
+Date: 2026-07-24
+Context: The model_ternary run (ternary encoding, cnot ring, 60 obs) had
+         plateaued at val_F1=0.30 since epoch 4 while burning ~40h/epoch, and
+         each epoch was so slow that no architecture change could be iterated.
+         Investigation of the slowness + a confusion-matrix read of the epoch-4
+         checkpoint drove the decisions below. The run was stopped
+         (`docker compose stop`; checkpoints preserved) and replaced by a fresh
+         run, model_ringlong.
+
+--------------------------------------------------------------------------------
+PROBLEM DIAGNOSIS (speed) + a correction to earlier assumptions
+--------------------------------------------------------------------------------
+
+Symptom: ~40h/epoch, ~1.35s/sample fwd+bwd on lightning.gpu (BATCH_SIZE=512,
+60 observables, adjoint differentiation).
+
+Root cause: diff_method="adjoint" cost scales LINEARLY with the number of
+measured observables. Isolation benchmarks (lightning.qubit CPU, one sample):
+  - forward, weights NOT requiring grad:  0.23 s/sample
+  - the moment weights require grad:      21.8 s/sample  (~93x)
+  - forward == forward+backward           => the whole cost is the adjoint
+    Jacobian, computed EAGERLY on the forward pass; torch.no_grad() does not
+    suppress it.
+The 60-observable measurement (Decision 2) is what makes that Jacobian
+expensive: adjoint re-does its reverse sweep per observable.
+
+  ** This corrects Decision 2's premise. ** Decision 2 ("Triple Pauli
+  Measurements") stated 20->60 outputs had "zero additional gate cost ... No
+  change to training time per batch." That is true for a pure forward pass, but
+  FALSE under adjoint differentiation, where training cost is ~proportional to
+  observable count. Measured on lightning.gpu: 60 obs = 1.35 s/sample (~32h/
+  epoch) vs 20 obs (PauliZ only) = 0.49 s/sample (~11.7h/epoch), a 2.75x
+  difference from the measurement count alone.
+
+Also corrected: a mid-investigation arithmetic error assumed BATCH_SIZE=64 and
+briefly mis-stated per-sample cost as ~11s. The real BATCH_SIZE is 512
+(config/defaults.py), so lightning.gpu is ~1.35 s/sample, and CPU/backprop
+"fixes" first benchmarked on lightning.qubit were actually SLOWER than the GPU
+baseline. Always benchmark on the device training actually uses (lightning.gpu).
+
+Dead end recorded: default.qubit + diff_method="backprop" would make cost
+observable-count-INDEPENDENT and would be ideal for high-parameter circuits, but
+it is CPU-bound here. On PennyLane 0.45, default.qubit allocates its statevector
+on CPU, so batched GPU execution dies with "Expected all tensors on the same
+device, cuda:0 and cpu" inside _prepare_batched_params. GPU backprop is
+therefore unavailable without patching PennyLane internals; adjoint on
+lightning.gpu remains the only practical trainer.
+
+--------------------------------------------------------------------------------
+PROBLEM DIAGNOSIS (accuracy) -- confusion structure of the plateau
+--------------------------------------------------------------------------------
+
+Confusion matrix of the epoch-4 checkpoint (stratified 15/class val
+subsample): the model is effectively a 3-way OS-FAMILY
+classifier with near-zero cross-family leakage.
+  - macOS: cleanly separated (13/15, precision 1.00) -- the only class that works.
+  - ALL Windows versions collapse into windows-10-pro (a sink: recall 1.00,
+    precision 0.23). windows-10 -- the largest class (27%) -- scores F1 0.00.
+  - Ubuntu rows churn among Ubuntu columns (random within-family) but never
+    cross into Windows/macOS.
+Conclusion: cross-family separation is ~perfect; within-family VERSION
+discrimination is ~random. The entire 12-class deficit is within-family (esp.
+windows-10 vs windows-10-pro). This matches the 2026-05-07 diagnosis but with a
+full matrix confirming the collapse direction. Dropping macOS would NOT help (it
+is the one class that works) and would only lower macro-F1.
+
+--------------------------------------------------------------------------------
+DECISION 7: "ring_long" entangler -- ring + long-range CNOT shortcuts
+            (rejects full all-to-all on MEASURED cost)
+--------------------------------------------------------------------------------
+
+Files changed: circuits/model.py (new "ring_long" branch + _entangle helper),
+config/defaults.py (SHORTCUT_OFFSETS), scripts/train.py (--entangler ring_long,
+--shortcut-offsets), training/hybrid_model.py, training/trainer.py.
+
+What: in addition to the nearest-neighbor ring, add a fixed CNOT between qubits
+i and (i+k) % N for each offset k in SHORTCUT_OFFSETS (default [5, 10]), every
+layer. Offset 10 = antipodal on 20 qubits; offset 5 = quarter-way. This shrinks
+the ring's graph diameter so distant feature-bits can correlate within a few
+layers instead of propagating all the way around the ring.
+
+Why: the confusion diagnosis says the missing capability is reachability between
+distant qubits whose bits jointly distinguish same-family versions. The ring
+(Decision 1) only correlates neighbors. Long-range shortcuts add that
+reachability. Fixed CNOTs => ZERO extra parameters (weight_shapes identical to
+"cnot", (n_layers, n_qubits, 2)) => no added barren-plateau risk from parameter
+count.
+
+What we considered but rejected (now with MEASURED numbers, superseding the
+2026-05-07 estimate in Decision 1 / "Changes not made #2"):
+  - Full all-to-all (190 CRZ pairs/layer, trainable): measured 4.94 s/sample on
+    lightning.gpu adjoint = ~118 h/epoch (~5 DAYS per epoch). Adjoint scales with
+    the 760 coupling parameters; backprop (which would not) is GPU-blocked (see
+    above). Impractical -- you cannot complete even one epoch to evaluate it.
+  - Trainable CRZ ring ("crz", Decision-era option): tunes entanglement STRENGTH
+    on the existing neighbor links but adds no new links, so it cannot reach
+    distant bits; also adds params/plateau risk. Deferred as a later A/B.
+  - ring_long [5,10] measured at 0.59 s/sample (Z-only) = ~14 h/epoch: it buys
+    the reachability at ~1/8th of all-to-all's gate cost and stays trainable.
+
+--------------------------------------------------------------------------------
+DECISION 8: Drop to 20 observables (PauliZ only)  -- partially reverses Decision 2
+--------------------------------------------------------------------------------
+
+Files changed: config/defaults.py (MEASURE_AXES), circuits/model.py
+(configurable measurement axes), training/hybrid_model.py (head input dim now
+len(measure_axes)*n_qubits, was hardcoded 3*n_qubits), scripts/train.py
+(--measure-axes), training/trainer.py (load_checkpoint restores saved axes).
+
+What: measure only PauliZ per qubit (20 outputs) instead of PauliZ+PauliX+PauliY
+(60). MEASURE_AXES is configurable and DEFAULTS to ["Z","X","Y"] so pre-existing
+checkpoints (which omit the key) rebuild to the identical 60-observable model.
+
+Why: per the speed diagnosis, adjoint training cost is ~proportional to
+observable count. 60->20 is the single biggest lever that keeps the model on the
+GPU: ~2.75x faster (32h -> 11.7h/epoch for the ring; ~14h/epoch combined with
+ring_long's extra gates). Decision 2's information-extraction argument still
+holds for a pure forward pass, but the X/Y axes were not earning their ~2x
+training-time cost given the model's already-weak within-family signal. If a
+future run shows X/Y materially help accuracy, MEASURE_AXES can restore them.
+
+--------------------------------------------------------------------------------
+STATUS / EXPECTED IMPACT (2026-07-24)
+--------------------------------------------------------------------------------
+
+Launched: fresh run "model_ringlong" via docker-compose --
+  --entangler ring_long --measure-axes Z --shortcut-offsets 5 10
+  --skip --batchnorm --dropout 0.1  (lightning.gpu)
+  ~14 h/epoch (benchmarked 0.59 s/sample), vs ~32h for model_ternary. All 40
+  unit tests pass. model_ternary.* checkpoints kept in models/ for A/B.
+
+Success criterion (binary, from the confusion diagnosis): does windows-10's F1
+rise off 0.00, or any within-family version F1 lift off the floor? If ring_long
+does not move within-family separation, the ceiling is architectural (smooth VQC
+vs sharp bit-conjunctions), and the next step is a hybrid (circuit does family-
+level, a stronger head / gradient-boosted trees do the fine split) rather than
+more entanglement. NOTE: gradient-boosted baselines on the SAME 20 features
+already beat this model, which localizes the gap to circuit feature-extraction,
+not the input features. (Superseded 2026-08-29: re-run on the identical
+stratified split, the QNN ties XGBoost-20 on macro F1 -- see Decision 10 and
+docs/Benchmarks.txt.)
+
+Not weight-compatible with model_ternary (different entangler parameterization
+AND observable count), so a fresh run + fresh model name was required.
+
+--------------------------------------------------------------------------------
+DECISION 9: XGBoost gain-ranked feature basis (was SelectKBest mutual info)
+--------------------------------------------------------------------------------
+
+Date: 2026-07-27.  Files changed: docker-compose.yml (command), data/pipeline.py
+(feature_names_to_indices), scripts/train.py (--feature-names); pipeline's
+SelectKBest path kept as the default when no names are given.
+
+What: model_xgb20 selects its 20 qubit features from an explicit list
+(--feature-names): the top-20 features by gain from an XGBoost classifier fit
+on the same data with the identifier columns removed, in rank order, instead
+of SelectKBest(mutual_info_classif).
+
+Why: mutual information ranks each feature independently (univariate), so it
+never credits a feature for being useful IN COMBINATION. XGBoost gain ranks
+features by how much they actually improved a strong supervised model's splits
+on the same 783-column leak-free basis. The gain ranking surfaced tcp_wsize_*
+window-size bits and control-flag bits (tcp_ackf_0, tcp_syn_0, tcp_rst_0) that
+the MI ranking missed. A new model name (model_xgb20, not model_ringlong) keeps
+--resume a safe no-op on first launch since the feature basis is not
+weight-compatible.
+
+Verified 2026-08-29: the stored feature_indices resolve to exactly the ranked
+top-20, in order, 20/20, on the identical 783-column removal basis.
+
+--------------------------------------------------------------------------------
+DECISION 10: Stop model_xgb20 at epoch 11; corrected benchmark protocol
+--------------------------------------------------------------------------------
+
+Dates: 2026-08-04 (stop + held-out eval), 2026-08-29 (verified comparison).
+Files: models/model_xgb20.{pt,json} (epoch-3 checkpoint), docs/Benchmarks.txt
+(canonical comparison), scripts/eval_heldout.py (held-out evaluation).
+
+What: stopped the model_xgb20 run at epoch 11/50 (clean SIGTERM; best val F1
+0.4122 (weighted) at epoch 3, 7 stale epochs). Evaluated the epoch-3 checkpoint on the
+reproduced stratified 20% split, then built a verified single-split comparison
+grid against XGBoost (docs/Benchmarks.txt).
+
+Why stopped rather than let early stopping fire (~epoch 13):
+  1. LR-scheduler blind spot (BUG, still open): ReduceLROnPlateau only steps
+     after the 3-epoch warmup, so it never saw epoch 3's best; its internal
+     best was epoch 9's. First possible LR halving ~epoch 16 -- AFTER early
+     stopping. The remaining epochs would have run at the same LR that
+     produced 7 flip-flop epochs. Fix before the next long run.
+  2. The val-F1 wobble was pair flip-flops (win10/win10-pro; ubuntu 16.4-32b/
+     14.4-64b trade F1 almost perfectly epoch to epoch), so a later "better"
+     epoch would be a different lottery draw, not a better model.
+
+Findings that correct earlier comparisons (full detail: docs/Benchmarks.txt):
+  - trainer's logged "Val_F1" is WEIGHTED F1; the XGBoost baseline logs MACRO. Mixed-up
+    earlier. On macro, QNN 0.3654 vs XGBoost-20 0.3480: a TIE (+0.017 macro,
+    -1.0pt accuracy), not a win.
+  - the XGBoost baseline splits unstratified, QNN stratified; same seed 42 gives a
+    completely different partition (test overlap exactly 20% = chance).
+  - scripts/test.py evaluates the full CSV including training rows (known
+    bug); held-out eval done via the archived _eval_heldout.py instead.
+  - Family level (mac/ubuntu/windows) is NOT a QNN differentiator: QNN 99.41%,
+    XGBoost-20 99.45%, XGBoost-783 99.59%. The family boundary is a property
+    of the feature basis.
+  - The 20-feature bottleneck is the binding constraint: XGBoost on all 783
+    leak-free features nearly doubles macro F1 (0.6547 vs 0.3654).
+
+--------------------------------------------------------------------------------
+CURRENT DESIGN + STATUS (2026-08-29)
+--------------------------------------------------------------------------------
+
+Circuit (model_xgb20): 20 qubits = 20 features (XGBoost gain-ranked top-20,
+Decision 9); ternary RY((x+1)*pi/2) encoding (Decision 6); ring_long entangler,
+fixed CNOT ring + shortcuts at offsets 5 and 10 (Decision 7); 4 variational
+layers with data re-uploading, RY+RZ per qubit per layer; PauliZ-only
+measurement, 20 expvals (Decision 8). 160 quantum parameters.
+
+Model: TorchLayer(QNode) -> concat raw 20 features (--skip) -> BatchNorm1d(40)
+-> Linear(40,128) -> ReLU -> Dropout(0.1) -> Linear(128,12). FocalLoss
+(class-weighted, gamma=2.0), Adam with 3-epoch warmup to LR 5e-3, adjoint
+differentiation on lightning.gpu, ~17.7 h/epoch.
+
+Evaluation caveat: the stratified 20% split is both the validation set (early
+stopping, LR scheduling, best-checkpoint selection) and the set every reported
+metric is computed on; there is no untouched holdout. See README "Known
+Limitations".
+
+State: run stopped 2026-08-04; epoch-3 checkpoint is the production artifact
+(models/model_xgb20.pt + .json). No training in flight.
+
+Next (in value order):
+  1. --no-quantum --skip ablation: same head/features/loss, no circuit. The
+     one experiment that decides whether the circuit contributes anything.
+  2. OS-family label merge (or hierarchical family->version heads): every
+     model saturates >=99.4% at family level; version level within windows/
+     ubuntu is where all remaining signal (and difficulty) lives.
+  3. Fix the LR-scheduler warmup blind spot (Decision 10, Why #1).
+  4. Class-weighted XGBoost-20 rerun for a loss-matched baseline; multiple
+     seeds before any external writeup.
