@@ -11,9 +11,16 @@ services:
     # graceful stop. Best-effort: a signal arriving mid-batch isn't handled
     # until the current batch ends (minutes under adjoint differentiation), so
     # the periodic mid-epoch checkpoint (every 50 batches) is the real
-    # durability guarantee. 120s covers a between-batch catch + the sub-MB
-    # checkpoint write without unduly delaying host shutdowns.
-    stop_grace_period: 120s
+    # durability guarantee. A batch measured ~108s in practice, so 300s buys
+    # roughly three batch boundaries plus the sub-MB checkpoint write. The
+    # host's docker.service TimeoutStopSec must exceed this, or systemd
+    # SIGKILLs dockerd mid-checkpoint during a host shutdown.
+    stop_grace_period: 300s
+    # Opt in to the host UPS power guard: on mains loss the container is
+    # stopped immediately, so the checkpoint happens while battery headroom
+    # is ample rather than seconds before poweroff. Restarted on mains return.
+    labels:
+      powerguard.stop: "true"
     deploy:
       resources:
         reservations:
